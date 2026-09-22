@@ -1,0 +1,18 @@
+[
+  { "query": "how does debezium capture database changes from postgres",
+    "relevant_doc_ids": ["postgres:documents:1"] },
+  { "query": "kafka compatible broker without a jvm",
+    "relevant_doc_ids": ["postgres:documents:2"] },
+  { "query": "combine lexical bm25 with semantic vector search",
+    "relevant_doc_ids": ["postgres:documents:3", "postgres:documents:4"] },
+  { "query": "reciprocal rank fusion constant k 60",
+    "relevant_doc_ids": ["postgres:documents:4"] },
+  { "query": "cross encoder reranker relevance scoring",
+    "relevant_doc_ids": ["postgres:documents:5"] },
+  { "query": "grounded generation citations faithfulness guardrail",
+    "relevant_doc_ids": ["postgres:documents:6"] },
+  { "query": "idempotent indexing version guard replay safe",
+    "relevant_doc_ids": ["postgres:documents:7"] },
+  { "query": "freshness lag service level objective commit timestamp",
+    "relevant_doc_ids": ["postgres:documents:8"] }
+]

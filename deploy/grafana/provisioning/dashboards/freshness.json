@@ -1,0 +1,76 @@
+{
+  "uid": "retrieval-freshness",
+  "title": "Retrieval + RAG — Freshness & Quality",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Freshness lag p99 (urgent tier) — SLO < 5s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(doc_freshness_lag_seconds_bucket{tier=\"urgent\"}[1m])) by (le, source))",
+          "legendFormat": "{{source}} p99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(doc_freshness_lag_seconds_bucket{tier=\"urgent\"}[1m])) by (le, source))",
+          "legendFormat": "{{source}} p50"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 5 } ] } } }
+    },
+    {
+      "id": 2,
+      "title": "Docs indexed / skipped (rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(indexer_docs_indexed_total[1m])) by (tier, op)", "legendFormat": "indexed {{tier}}/{{op}}" },
+        { "expr": "sum(rate(indexer_docs_skipped_total[1m]))", "legendFormat": "skipped (stale)" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Search stage latency p95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(search_stage_latency_seconds_bucket[1m])) by (le, stage))", "legendFormat": "{{stage}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 4,
+      "title": "RAG faithfulness (avg)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(rag_faithfulness_score_sum[5m])) / sum(rate(rag_faithfulness_score_count[5m]))", "legendFormat": "faithfulness" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 0.9 } ] } } }
+    },
+    {
+      "id": 5,
+      "title": "DLQ events",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(indexer_dlq_events_total[1m])) by (reason)", "legendFormat": "{{reason}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Cache hit ratio",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "sum(rate(query_cache_hits_total[5m])) / clamp_min(sum(rate(query_cache_hits_total[5m])) + sum(rate(query_cache_misses_total[5m])), 1)", "legendFormat": "hit ratio" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "unit": "percentunit" } }
+    }
+  ]
+}

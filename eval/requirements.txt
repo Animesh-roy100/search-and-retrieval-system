@@ -1,0 +1,3 @@
+# Eval harness uses only the Python standard library at runtime.
+# pytest is only needed to run the metric unit tests.
+pytest==8.3.4
