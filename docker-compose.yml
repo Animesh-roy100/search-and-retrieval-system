@@ -168,9 +168,9 @@ services:
       METRICS_ADDR: ":9102"
       LLM_PROVIDER: ${LLM_PROVIDER:-extractive}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-    ports: ["8080:8080", "9102:9102"]
+    ports: ["${QUERY_HOST_PORT:-8080}:8080", "9102:9102"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      test: ["CMD", "/app", "healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 30

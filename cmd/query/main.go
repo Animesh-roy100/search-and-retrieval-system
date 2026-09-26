@@ -8,7 +8,11 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -33,10 +37,53 @@ type server struct {
 	rerankN  int
 	topK     int
 	faithMin float64
+	apiKey   string // if set, requests must present it; also gates tenant requirement
+	reqTO    time.Duration
+}
+
+// authTenant enforces the API key (when configured) and resolves the tenant from a
+// trusted header. When an API key is configured the tenant is mandatory, so a client
+// can never read across tenants by omitting the filter. Returns the tenant id (may be
+// "" only in open/dev mode) and whether the request is authorized.
+func (s *server) authTenant(r *http.Request) (tenant string, ok bool) {
+	if s.apiKey != "" {
+		presented := r.Header.Get("X-API-Key")
+		if presented == "" {
+			presented = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		}
+		if presented != s.apiKey {
+			return "", false
+		}
+		tenant = strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
+		if tenant == "" {
+			return "", false // authenticated but no tenant scope -> reject
+		}
+	} else {
+		tenant = strings.TrimSpace(r.Header.Get("X-Tenant-ID")) // optional in dev
+	}
+	return tenant, true
+}
+
+// scopeFilters force-injects the server-resolved tenant into the filter set, ignoring
+// any client-supplied tenant_id. This is the tenant isolation boundary.
+func scopeFilters(filters map[string]string, tenant string) map[string]string {
+	if tenant == "" {
+		return filters
+	}
+	if filters == nil {
+		filters = map[string]string{}
+	}
+	filters["tenant_id"] = tenant
+	return filters
 }
 
 func main() {
 	addr := config.Str("QUERY_ADDR", ":8080")
+	// Self healthcheck: `app healthcheck` hits /health and exits 0/1. This works in
+	// the distroless image, which has no shell/wget for a CMD-SHELL healthcheck.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		runHealthcheck(addr)
+	}
 	osc, err := opensearch.New(config.Str("OPENSEARCH_URL", "http://localhost:9200"))
 	if err != nil {
 		log.Fatalf("query: opensearch client: %v", err)
@@ -54,6 +101,11 @@ func main() {
 		rerankN:  config.Int("RERANK_TOP_N", 50),
 		topK:     config.Int("RAG_TOP_K", 6),
 		faithMin: config.Float("FAITHFULNESS_THRESHOLD", 0.9),
+		apiKey:   config.Str("QUERY_API_KEY", ""),
+		reqTO:    config.Dur("REQUEST_TIMEOUT", 5*time.Second),
+	}
+	if s.apiKey == "" {
+		log.Print("query: QUERY_API_KEY unset — running open (dev mode), tenant isolation not enforced")
 	}
 	log.Printf("query: llm provider = %s", s.llm.Name())
 
@@ -88,40 +140,41 @@ type askReq struct {
 	TopK    int               `json:"top_k,omitempty"`
 }
 
-// candidate carries a doc through the pipeline.
-type candidate struct {
-	DocID  string
-	Vector []float32
-	Doc    opensearch.Doc
-}
-
 // retrieve runs hybrid retrieval and returns ordered doc ids + assembled docs.
 func (s *server) retrieve(ctx context.Context, query string, filters map[string]string, topK int) ([]rag.Source, error) {
-	// 1) embed query (vector lane). If ML is down we degrade to BM25-only.
-	var qvec []float32
-	t0 := time.Now()
-	if vecs, _, err := s.ml.Embed(ctx, []string{query}); err == nil && len(vecs) > 0 {
-		qvec = vecs[0]
-	} else {
-		log.Printf("query: embed failed, degrading to BM25-only: %v", err)
-	}
-	obs.SearchStageLatency.WithLabelValues("embed").Observe(time.Since(t0).Seconds())
-
-	// 2) BM25 + vector in parallel.
+	// 1) & 2) Run the lexical and vector lanes concurrently. BM25 needs only the raw
+	// query, so it runs immediately; the vector lane first embeds the query. Each lane
+	// degrades independently (BM25-only if the embed/Qdrant is down, vector-only if
+	// OpenSearch is down). Both are bounded by the request's context deadline.
 	var bm25IDs, vecIDs []string
-	t1 := time.Now()
-	if hits, err := s.os.Search(ctx, query, filters, s.rerankN); err == nil {
-		for _, h := range hits {
-			bm25IDs = append(bm25IDs, h.DocID)
-		}
-	} else {
-		log.Printf("query: opensearch down, vector-only: %v", err)
-	}
-	obs.SearchStageLatency.WithLabelValues("bm25").Observe(time.Since(t1).Seconds())
+	var wg sync.WaitGroup
 
-	if qvec != nil {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t1 := time.Now()
+		if hits, err := s.os.Search(ctx, query, filters, s.rerankN); err == nil {
+			for _, h := range hits {
+				bm25IDs = append(bm25IDs, h.DocID)
+			}
+		} else {
+			log.Printf("query: opensearch down, vector-only: %v", err)
+		}
+		obs.SearchStageLatency.WithLabelValues("bm25").Observe(time.Since(t1).Seconds())
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t0 := time.Now()
+		vecs, _, err := s.ml.Embed(ctx, []string{query})
+		obs.SearchStageLatency.WithLabelValues("embed").Observe(time.Since(t0).Seconds())
+		if err != nil || len(vecs) == 0 {
+			log.Printf("query: embed failed, degrading to BM25-only: %v", err)
+			return
+		}
 		t2 := time.Now()
-		if hits, err := s.qd.Search(ctx, qvec, filters, s.rerankN); err == nil {
+		if hits, err := s.qd.Search(ctx, vecs[0], filters, s.rerankN); err == nil {
 			for _, h := range hits {
 				vecIDs = append(vecIDs, h.DocID)
 			}
@@ -129,7 +182,9 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 			log.Printf("query: qdrant down, BM25-only: %v", err)
 		}
 		obs.SearchStageLatency.WithLabelValues("vector").Observe(time.Since(t2).Seconds())
-	}
+	}()
+
+	wg.Wait()
 
 	// 3) RRF fuse.
 	fused := retrieve.RRF([][]string{bm25IDs, vecIDs}, s.rrfK)
@@ -196,12 +251,19 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 }
 
 func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.authTenant(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
 	var req askReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Query == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "query required"})
 		return
 	}
-	ctx := r.Context()
+	req.Filters = scopeFilters(req.Filters, tenant)
+	ctx, cancel := context.WithTimeout(r.Context(), s.reqTO)
+	defer cancel()
 	start := time.Now()
 	sources, err := s.retrieve(ctx, req.Query, req.Filters, req.TopK)
 	if err != nil {
@@ -214,14 +276,22 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.authTenant(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
 	var req askReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Query == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "query required"})
 		return
 	}
-	ctx := r.Context()
+	req.Filters = scopeFilters(req.Filters, tenant)
+	ctx, cancel := context.WithTimeout(r.Context(), s.reqTO)
+	defer cancel()
 	start := time.Now()
 
+	// tenant is part of req.Filters, so the cache key is naturally per-tenant.
 	key := cache.Key(req.Query, req.Filters)
 	var cached map[string]any
 	if s.cache.Get(ctx, key, &cached) {
@@ -274,21 +344,23 @@ func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
 }
 
 func markerFor(n int) string {
-	return "doc_" + itoa(n)
+	return "doc_" + strconv.Itoa(n)
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+// runHealthcheck probes the local /health endpoint and exits (0 = healthy).
+func runHealthcheck(addr string) {
+	host := addr
+	if strings.HasPrefix(host, ":") {
+		host = "127.0.0.1" + host
 	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+host+"/health", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		os.Exit(1)
 	}
-	return string(buf[i:])
+	os.Exit(0)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -296,5 +368,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-
-var _ = candidate{}

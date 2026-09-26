@@ -78,17 +78,39 @@ type osDoc struct {
 	CommitTS string `json:"commit_ts"`
 }
 
-// Bulk applies upserts and deletes in a single _bulk request using external
-// versioning so stale writes are rejected. Version conflicts (409) are tolerated.
-func (c *Client) Bulk(ctx context.Context, docs []contract.CanonicalDoc) error {
+// Bulk applies upserts and deletes in a single _bulk request. Both actions use
+// external versioning so a stale write (version <= stored) is rejected with 409
+// rather than clobbering fresher data — this is what makes replay/rebalance safe.
+//
+// It returns the set of doc_ids that were actually applied here: upserts that
+// succeeded (2xx), and deletes that succeeded or found nothing to delete (2xx/404).
+// A 409 means the store already holds an equal-or-newer version, so the doc is
+// NOT in the applied set and callers must not propagate it to other sinks. Any
+// other >=400 status is a hard error (the batch is retried, offsets uncommitted).
+//
+// OpenSearch is thus the single version authority; Qdrant is driven off this set.
+func (c *Client) Bulk(ctx context.Context, docs []contract.CanonicalDoc) (map[string]bool, error) {
 	if len(docs) == 0 {
-		return nil
+		return map[string]bool{}, nil
 	}
+	// _bulk preserves item order; track the doc_id + action for each line.
+	type line struct {
+		docID    string
+		isDelete bool
+	}
+	var order []line
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	for _, d := range docs {
 		if d.Op == contract.OpDelete {
-			_ = enc.Encode(map[string]any{"delete": map[string]any{"_index": Index, "_id": d.DocID}})
+			// External version on delete too: a stale delete (e.g. replayed from the
+			// DLQ) must not remove a doc that has since been re-created at a higher
+			// version. OpenSearch rejects it with 409.
+			_ = enc.Encode(map[string]any{"delete": map[string]any{
+				"_index": Index, "_id": d.DocID,
+				"version": d.Version, "version_type": "external",
+			}})
+			order = append(order, line{docID: d.DocID, isDelete: true})
 			continue
 		}
 		_ = enc.Encode(map[string]any{"index": map[string]any{
@@ -100,24 +122,37 @@ func (c *Client) Bulk(ctx context.Context, docs []contract.CanonicalDoc) error {
 			Title: d.Title, Body: d.Body, Category: d.Metadata.Category,
 			Version: d.Version, CommitTS: d.CommitTS.UTC().Format(time.RFC3339Nano),
 		})
+		order = append(order, line{docID: d.DocID, isDelete: false})
 	}
 	resp, err := c.api.Bulk(ctx, opensearchapi.BulkReq{
 		Body:   bytes.NewReader(buf.Bytes()),
 		Params: opensearchapi.BulkParams{Refresh: "true"},
 	})
 	if err != nil {
-		return fmt.Errorf("opensearch: bulk: %w", err)
+		return nil, fmt.Errorf("opensearch: bulk: %w", err)
 	}
-	if resp.Errors {
-		for _, item := range resp.Items {
-			for _, res := range item {
-				if res.Status >= 400 && res.Status != 409 {
-					return fmt.Errorf("opensearch: bulk item failed: status=%d", res.Status)
-				}
+
+	applied := make(map[string]bool, len(order))
+	for i, item := range resp.Items {
+		if i >= len(order) {
+			break
+		}
+		ln := order[i]
+		for _, res := range item { // one entry per item, keyed by action
+			switch {
+			case res.Status < 300:
+				applied[ln.docID] = true
+			case res.Status == 409:
+				// stale — store already has an equal/newer version; do not propagate.
+			case res.Status == 404 && ln.isDelete:
+				// nothing to delete; safe to propagate the delete to other sinks.
+				applied[ln.docID] = true
+			default:
+				return nil, fmt.Errorf("opensearch: bulk item %q failed: status=%d", ln.docID, res.Status)
 			}
 		}
 	}
-	return nil
+	return applied, nil
 }
 
 // --- search ---

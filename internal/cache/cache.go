@@ -25,7 +25,14 @@ func New(addr string, ttl time.Duration) *Cache {
 	if addr == "" {
 		return &Cache{ttl: ttl}
 	}
-	return &Cache{rdb: redis.NewClient(&redis.Options{Addr: addr}), ttl: ttl}
+	// Tight timeouts so a slow/degraded Redis fails fast to a miss instead of
+	// blowing the read-path latency SLO — the graceful-miss design absorbs it.
+	return &Cache{rdb: redis.NewClient(&redis.Options{
+		Addr:         addr,
+		DialTimeout:  200 * time.Millisecond,
+		ReadTimeout:  100 * time.Millisecond,
+		WriteTimeout: 100 * time.Millisecond,
+	}), ttl: ttl}
 }
 
 // Key normalizes a query + filters into a stable cache key.

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os/signal"
 	"sync/atomic"
@@ -121,13 +122,22 @@ func (ix *indexer) runLane(ctx context.Context, brokers []string, group, topic s
 	}
 
 	for {
-		fetches := cl.PollFetches(ctx)
+		// Bound each poll to the flush interval so the time-based flush below is
+		// re-evaluated even when the lane is idle. Without this, PollFetches blocks
+		// until new records arrive and a buffered batch is stranded — which strands
+		// the low-traffic bulk lane indefinitely.
+		pollCtx, cancel := context.WithTimeout(ctx, flush)
+		fetches := cl.PollFetches(pollCtx)
+		cancel()
 		if ctx.Err() != nil {
 			flushBatch()
 			return
 		}
 		if errs := fetches.Errors(); len(errs) > 0 {
 			for _, e := range errs {
+				if errors.Is(e.Err, context.DeadlineExceeded) {
+					continue // idle poll timeout — expected; lets the flush timer run
+				}
 				log.Printf("indexer[%s]: fetch: %v", tier, e.Err)
 			}
 		}
@@ -149,8 +159,8 @@ func (ix *indexer) runLane(ctx context.Context, brokers []string, group, topic s
 		})
 
 		// Flush when the batch is full (throughput) OR when the flush interval has
-		// elapsed since the first buffered record (bounded latency). This is
-		// deterministic under any poll cadence — no ticker race, no idle heuristic.
+		// elapsed since the first buffered record (bounded latency). The bounded poll
+		// above guarantees this check runs at least once per flush interval.
 		if len(batch) >= 256 || (len(batch) > 0 && time.Since(batchStart) >= flush) {
 			flushBatch()
 		}
@@ -179,10 +189,24 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 		return nil
 	}
 
-	// 2) Split upserts/deletes; embed upserts.
+	// 2) OpenSearch first — it is the version authority. External versioning means
+	// stale writes are rejected (409) here; the returned set is the docs actually
+	// applied, and only those are propagated to Qdrant. This keeps the two stores
+	// consistent even when the in-memory guard is empty (restart / group rebalance).
+	t0 := time.Now()
+	applied, err := ix.os.Bulk(ctx, toApply)
+	if err != nil {
+		return err
+	}
+	obs.BulkWriteSeconds.WithLabelValues("opensearch").Observe(time.Since(t0).Seconds())
+
+	// 3) Split the applied docs into upserts/deletes; embed + write Qdrant.
 	var upserts []contract.CanonicalDoc
 	var deletes []string
 	for _, d := range toApply {
+		if !applied[d.DocID] {
+			continue // stale per OpenSearch — do not touch the vector store
+		}
 		if d.Op == contract.OpDelete {
 			deletes = append(deletes, d.DocID)
 		} else {
@@ -213,13 +237,6 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 		}
 	}
 
-	// 3) Bulk write both sinks. OpenSearch first (BM25), then Qdrant (vectors).
-	t0 := time.Now()
-	if err := ix.os.Bulk(ctx, toApply); err != nil {
-		return err
-	}
-	obs.BulkWriteSeconds.WithLabelValues("opensearch").Observe(time.Since(t0).Seconds())
-
 	t1 := time.Now()
 	if len(points) > 0 {
 		if err := ix.qd.Upsert(ctx, points); err != nil {
@@ -233,9 +250,12 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 	}
 	obs.BulkWriteSeconds.WithLabelValues("qdrant").Observe(time.Since(t1).Seconds())
 
-	// 4) Commit guard + observe freshness lag per doc.
+	// 4) Commit guard + observe freshness lag per applied doc.
 	now := time.Now()
 	for _, d := range toApply {
+		if !applied[d.DocID] {
+			continue
+		}
 		ix.guard.Commit(d.DocID, d.Version)
 		lag := now.Sub(d.CommitTS).Seconds()
 		if lag < 0 {

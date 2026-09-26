@@ -3,7 +3,10 @@
 // (diversify the reranked set).
 package retrieve
 
-import "sort"
+import (
+	"math"
+	"sort"
+)
 
 // Scored is a doc id with a fusion/relevance score.
 type Scored struct {
@@ -81,17 +84,5 @@ func cosine(a, b []float32) float64 {
 	if na == 0 || nb == 0 {
 		return 0
 	}
-	return dot / (sqrt(na) * sqrt(nb))
-}
-
-func sqrt(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	// Newton's method — avoids importing math for one call in hot path tests.
-	z := x
-	for i := 0; i < 20; i++ {
-		z -= (z*z - x) / (2 * z)
-	}
-	return z
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
