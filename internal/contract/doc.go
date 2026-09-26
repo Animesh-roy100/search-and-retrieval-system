@@ -28,18 +28,18 @@ const (
 
 // CanonicalDoc is the single shape emitted by every normalizer.
 type CanonicalDoc struct {
-	Source    string    `json:"source"`
-	SourceID  string    `json:"source_id"`
-	DocID     string    `json:"doc_id"`
-	TenantID  int64     `json:"tenant_id"`
-	Op        Op        `json:"op"`
-	Tier      Tier      `json:"tier"`
-	Version   int64     `json:"version"`
-	CommitTS  time.Time `json:"commit_ts"`
-	Title     string    `json:"title,omitempty"`
-	Body      string    `json:"body,omitempty"`
-	ChunkID   int       `json:"chunk_id,omitempty"`
-	Metadata  Metadata  `json:"metadata,omitempty"`
+	Source   string    `json:"source"`
+	SourceID string    `json:"source_id"`
+	DocID    string    `json:"doc_id"`
+	TenantID int64     `json:"tenant_id"`
+	Op       Op        `json:"op"`
+	Tier     Tier      `json:"tier"`
+	Version  int64     `json:"version"`
+	CommitTS time.Time `json:"commit_ts"`
+	Title    string    `json:"title,omitempty"`
+	Body     string    `json:"body,omitempty"`
+	ChunkID  int       `json:"chunk_id,omitempty"`
+	Metadata Metadata  `json:"metadata,omitempty"`
 }
 
 // Metadata is free-form provenance carried through to the search stores.

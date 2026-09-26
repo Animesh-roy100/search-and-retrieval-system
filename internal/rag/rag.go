@@ -22,8 +22,8 @@ type Source struct {
 
 // Answer is the generated result.
 type Answer struct {
-	Text     string
-	Model    string
+	Text      string
+	Model     string
 	Citations []Citation
 }
 

@@ -1,6 +1,10 @@
 package rag
 
-import "regexp"
+import (
+	"context"
+	"log"
+	"regexp"
+)
 
 var citationMarker = regexp.MustCompile(`\[doc_\d+\]`)
 
@@ -8,6 +12,28 @@ var citationMarker = regexp.MustCompile(`\[doc_\d+\]`)
 type FaithfulnessResult struct {
 	Score       float64  `json:"score"`
 	Unsupported []string `json:"unsupported,omitempty"`
+}
+
+// Judge is implemented by providers that can score faithfulness with an LLM.
+type Judge interface {
+	JudgeFaithfulness(ctx context.Context, answer string, sources []Source) (FaithfulnessResult, error)
+}
+
+// ScoreFaithfulness picks the faithfulness strategy. With mode "llm" and a provider
+// that implements Judge, it uses the LLM judge (understands paraphrase/entailment)
+// and falls back to the deterministic lexical check on any error. Otherwise it uses
+// the lexical check — which is the right calibration for the extractive provider.
+func ScoreFaithfulness(ctx context.Context, mode string, provider Provider, answer string, sources []Source) FaithfulnessResult {
+	if mode == "llm" {
+		if j, ok := provider.(Judge); ok {
+			if res, err := j.JudgeFaithfulness(ctx, answer, sources); err == nil {
+				return res
+			} else {
+				log.Printf("rag: llm judge failed, falling back to lexical: %v", err)
+			}
+		}
+	}
+	return Faithfulness(answer, sources)
 }
 
 // Faithfulness scores an answer by the fraction of its sentences that are supported

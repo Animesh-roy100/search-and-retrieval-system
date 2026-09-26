@@ -53,8 +53,8 @@ func (c *Client) EnsureIndex(ctx context.Context) error {
       }}
     }`
 	_, err := c.api.Indices.Create(ctx, opensearchapi.IndicesCreateReq{
-		Index:      Index,
-		Body:       strings.NewReader(body),
+		Index: Index,
+		Body:  strings.NewReader(body),
 	})
 	if err != nil {
 		var osErr *opensearch.StructError
@@ -178,8 +178,8 @@ func (c *Client) Search(ctx context.Context, query string, filters map[string]st
 	}
 	b, _ := json.Marshal(body)
 	resp, err := c.api.Search(ctx, &opensearchapi.SearchReq{
-		Indices:    []string{Index},
-		Body:       bytes.NewReader(b),
+		Indices: []string{Index},
+		Body:    bytes.NewReader(b),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("opensearch: search: %w", err)

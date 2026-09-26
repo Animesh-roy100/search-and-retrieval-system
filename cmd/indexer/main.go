@@ -9,12 +9,14 @@ import (
 	"errors"
 	"log"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/animeshroy/search-and-retrieval-system/internal/cache"
 	"github.com/animeshroy/search-and-retrieval-system/internal/config"
 	"github.com/animeshroy/search-and-retrieval-system/internal/contract"
 	"github.com/animeshroy/search-and-retrieval-system/internal/idempotency"
@@ -31,13 +33,14 @@ import (
 var tracer = tracing.Tracer("indexer")
 
 type indexer struct {
-	os     *opensearch.Client
-	qd     *qdrant.Client
-	ml     *mlclient.Client
-	guard  *idempotency.Guard
-	dlq    string
-	prod   *kgo.Client
-	tier   string
+	os    *opensearch.Client
+	qd    *qdrant.Client
+	ml    *mlclient.Client
+	guard *idempotency.Guard
+	cache *cache.Cache // used only to bump per-tenant cache generation on write
+	dlq   string
+	prod  *kgo.Client
+	tier  string
 }
 
 func main() {
@@ -60,6 +63,7 @@ func main() {
 	}
 	mlc := mlclient.New(config.Str("ML_SERVICE_ADDR", "http://localhost:8000"))
 	guard := idempotency.NewGuard()
+	invalidator := cache.New(config.Str("REDIS_ADDR", ""), 0) // no-op if REDIS_ADDR unset
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -99,7 +103,7 @@ func main() {
 
 	// One consumer per lane so the fast lane is never blocked by a bulk backlog,
 	// and each lane can use its own flush cadence.
-	ix := &indexer{os: osc, qd: qdc, ml: mlc, guard: guard, dlq: dlqTopic, prod: prod}
+	ix := &indexer{os: osc, qd: qdc, ml: mlc, guard: guard, cache: invalidator, dlq: dlqTopic, prod: prod}
 	go ix.runLane(ctx, brokers, group+"-fast", fastTopic, fastFlush, "urgent")
 	ix.runLane(ctx, brokers, group+"-bulk", bulkTopic, bulkFlush, "bulk")
 }
@@ -273,19 +277,28 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 	qdSp.End()
 	obs.BulkWriteSeconds.WithLabelValues("qdrant").Observe(time.Since(t1).Seconds())
 
-	// 4) Commit guard + observe freshness lag per applied doc.
+	// 4) Commit guard + observe freshness lag per applied doc, and note which
+	// tenants changed so we can invalidate their cached answers.
 	now := time.Now()
+	tenantsChanged := map[string]struct{}{}
 	for _, d := range toApply {
 		if !applied[d.DocID] {
 			continue
 		}
 		ix.guard.Commit(d.DocID, d.Version)
+		tenantsChanged[strconv.FormatInt(d.TenantID, 10)] = struct{}{}
 		lag := now.Sub(d.CommitTS).Seconds()
 		if lag < 0 {
 			lag = 0
 		}
 		obs.FreshnessLag.WithLabelValues(d.Source, string(d.Tier)).Observe(lag)
 		obs.DocsIndexed.WithLabelValues(d.Source, string(d.Tier), string(d.Op)).Inc()
+	}
+
+	// 5) Bump each changed tenant's cache generation → their cached answers become
+	// stale immediately (freshness-safe caching). Best-effort; a miss just re-fetches.
+	for tenant := range tenantsChanged {
+		ix.cache.BumpGeneration(ctx, tenant)
 	}
 	return nil
 }

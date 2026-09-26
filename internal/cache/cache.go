@@ -7,7 +7,9 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,9 +37,12 @@ func New(addr string, ttl time.Duration) *Cache {
 	}), ttl: ttl}
 }
 
-// Key normalizes a query + filters into a stable cache key.
-func Key(query string, filters map[string]string) string {
+// Key normalizes a query + filters + generation into a stable cache key. Folding
+// the generation in means a write that bumps the tenant's generation makes every
+// prior key unreachable — instant, cheap invalidation without scanning keys.
+func Key(query string, filters map[string]string, gen int64) string {
 	var b strings.Builder
+	fmt.Fprintf(&b, "g%d|", gen)
 	b.WriteString(strings.ToLower(strings.TrimSpace(query)))
 	// deterministic filter order
 	keys := make([]string, 0, len(filters))
@@ -50,6 +55,36 @@ func Key(query string, filters map[string]string) string {
 	}
 	sum := sha1.Sum([]byte(b.String()))
 	return "ans:" + hex.EncodeToString(sum[:])
+}
+
+// genKey is the Redis key holding a tenant's cache generation.
+func genKey(tenant string) string {
+	if tenant == "" {
+		tenant = "_global"
+	}
+	return "gen:" + tenant
+}
+
+// Generation returns the tenant's current cache generation (0 if unset / no Redis).
+func (c *Cache) Generation(ctx context.Context, tenant string) int64 {
+	if c == nil || c.rdb == nil {
+		return 0
+	}
+	v, err := c.rdb.Get(ctx, genKey(tenant)).Result()
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(v, 10, 64)
+	return n
+}
+
+// BumpGeneration advances a tenant's cache generation, invalidating that tenant's
+// cached answers. Called by the indexer whenever it writes docs for a tenant.
+func (c *Cache) BumpGeneration(ctx context.Context, tenant string) {
+	if c == nil || c.rdb == nil {
+		return
+	}
+	_ = c.rdb.Incr(ctx, genKey(tenant)).Err()
 }
 
 func (c *Cache) Get(ctx context.Context, key string, out any) bool {

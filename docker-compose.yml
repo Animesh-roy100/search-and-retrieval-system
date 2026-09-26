@@ -140,12 +140,14 @@ services:
       opensearch: { condition: service_healthy }
       qdrant: { condition: service_healthy }
       mlservice: { condition: service_healthy }
+      redis: { condition: service_healthy }
     environment:
       REDPANDA_BROKERS: redpanda:29092
       OPENSEARCH_URL: http://opensearch:9200
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6334"
       ML_SERVICE_ADDR: http://mlservice:8000
+      REDIS_ADDR: redis:6379
       METRICS_ADDR: ":9101"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4317}
       OTEL_EXPORTER_OTLP_INSECURE: "true"
