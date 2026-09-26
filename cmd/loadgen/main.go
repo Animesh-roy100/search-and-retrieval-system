@@ -187,9 +187,9 @@ func (c *runConfig) insertBatch(rng *rand.Rand, n int) error {
 			tier = "urgent"
 		}
 		args = append(args,
-			int64(rng.Intn(10)+1),          // tenant_id
-			c.title(rng),                   // title
-			c.body(rng),                    // body
+			int64(rng.Intn(10)+1), // tenant_id
+			c.title(rng),          // title
+			c.body(rng),           // body
 			categories[rng.Intn(len(categories))],
 			tier,
 		)
@@ -247,10 +247,10 @@ func (c *runConfig) progress(start time.Time, total int) {
 
 // limiter is a simple token-bucket-ish rate limiter granting `rate` units/sec.
 type limiter struct {
-	mu       sync.Mutex
-	rate     float64
-	allow    float64
-	last     time.Time
+	mu    sync.Mutex
+	rate  float64
+	allow float64
+	last  time.Time
 }
 
 func newLimiter(rate int) *limiter {

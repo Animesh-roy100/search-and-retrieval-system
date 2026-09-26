@@ -25,6 +25,7 @@ import (
 	"github.com/animeshroy/search-and-retrieval-system/internal/qdrant"
 	"github.com/animeshroy/search-and-retrieval-system/internal/rag"
 	"github.com/animeshroy/search-and-retrieval-system/internal/retrieve"
+	"github.com/animeshroy/search-and-retrieval-system/internal/semcache"
 	"github.com/animeshroy/search-and-retrieval-system/internal/tracing"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -36,17 +37,19 @@ import (
 var tracer = tracing.Tracer("query")
 
 type server struct {
-	os       *opensearch.Client
-	qd       *qdrant.Client
-	ml       *mlclient.Client
-	cache    *cache.Cache
-	llm      rag.Provider
-	rrfK     int
-	rerankN  int
-	topK     int
-	faithMin float64
-	apiKey   string // if set, requests must present it; also gates tenant requirement
-	reqTO    time.Duration
+	os        *opensearch.Client
+	qd        *qdrant.Client
+	ml        *mlclient.Client
+	cache     *cache.Cache
+	sem       *semcache.Cache
+	llm       rag.Provider
+	rrfK      int
+	rerankN   int
+	topK      int
+	faithMin  float64
+	faithMode string // "lexical" (default) or "llm"
+	apiKey    string // if set, requests must present it; also gates tenant requirement
+	reqTO     time.Duration
 }
 
 // authTenant enforces the API key (when configured) and resolves the tenant from a
@@ -102,15 +105,24 @@ func main() {
 	}
 	mlc := mlclient.New(config.Str("ML_SERVICE_ADDR", "http://localhost:8000"))
 	c := cache.New(config.Str("REDIS_ADDR", ""), config.Dur("CACHE_TTL", 5*time.Minute))
+	sem, err := semcache.New(
+		config.Str("QDRANT_HOST", "localhost"), config.Int("QDRANT_PORT", 6334),
+		config.Float("SEM_CACHE_THRESHOLD", 0.95),
+		config.Str("SEM_CACHE", "true") != "false",
+	)
+	if err != nil {
+		log.Fatalf("query: semcache: %v", err)
+	}
 
 	s := &server{
-		os: osc, qd: qdc, ml: mlc, cache: c, llm: rag.NewProvider(),
-		rrfK:     config.Int("RRF_K", 60),
-		rerankN:  config.Int("RERANK_TOP_N", 50),
-		topK:     config.Int("RAG_TOP_K", 6),
-		faithMin: config.Float("FAITHFULNESS_THRESHOLD", 0.9),
-		apiKey:   config.Str("QUERY_API_KEY", ""),
-		reqTO:    config.Dur("REQUEST_TIMEOUT", 5*time.Second),
+		os: osc, qd: qdc, ml: mlc, cache: c, sem: sem, llm: rag.NewProvider(),
+		rrfK:      config.Int("RRF_K", 60),
+		rerankN:   config.Int("RERANK_TOP_N", 50),
+		topK:      config.Int("RAG_TOP_K", 6),
+		faithMin:  config.Float("FAITHFULNESS_THRESHOLD", 0.9),
+		faithMode: config.Str("FAITHFULNESS_MODE", "lexical"),
+		apiKey:    config.Str("QUERY_API_KEY", ""),
+		reqTO:     config.Dur("REQUEST_TIMEOUT", 5*time.Second),
 	}
 	if s.apiKey == "" {
 		log.Print("query: QUERY_API_KEY unset — running open (dev mode), tenant isolation not enforced")
@@ -125,6 +137,13 @@ func main() {
 		log.Printf("query: tracing init: %v", err)
 	}
 	defer func() { _ = shutdownTracing(context.Background()) }()
+
+	// Size the semantic-cache collection to the embedding dimension.
+	if dim := probeDim(ctx, mlc); dim > 0 {
+		if err := sem.Ensure(ctx, dim); err != nil {
+			log.Printf("query: semcache ensure: %v", err)
+		}
+	}
 
 	var ready atomic.Bool
 	ready.Store(true)
@@ -161,7 +180,8 @@ type askReq struct {
 }
 
 // retrieve runs hybrid retrieval and returns ordered doc ids + assembled docs.
-func (s *server) retrieve(ctx context.Context, query string, filters map[string]string, topK int) ([]rag.Source, error) {
+// qvec is the precomputed query embedding; if nil the vector lane embeds internally.
+func (s *server) retrieve(ctx context.Context, query string, filters map[string]string, topK int, qvec []float32) ([]rag.Source, error) {
 	ctx, span := tracer.Start(ctx, "retrieve")
 	defer span.End()
 
@@ -191,19 +211,23 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		embCtx, embSp := tracer.Start(ctx, "embed")
-		t0 := time.Now()
-		vecs, _, err := s.ml.Embed(embCtx, []string{query})
-		obs.SearchStageLatency.WithLabelValues("embed").Observe(time.Since(t0).Seconds())
-		embSp.End()
-		if err != nil || len(vecs) == 0 {
-			log.Printf("query: embed failed, degrading to BM25-only: %v", err)
-			return
+		v := qvec
+		if v == nil { // /search path: no precomputed embedding, embed here
+			embCtx, embSp := tracer.Start(ctx, "embed")
+			t0 := time.Now()
+			vecs, _, err := s.ml.Embed(embCtx, []string{query})
+			obs.SearchStageLatency.WithLabelValues("embed").Observe(time.Since(t0).Seconds())
+			embSp.End()
+			if err != nil || len(vecs) == 0 {
+				log.Printf("query: embed failed, degrading to BM25-only: %v", err)
+				return
+			}
+			v = vecs[0]
 		}
 		vecCtx, vecSp := tracer.Start(ctx, "vector")
 		defer vecSp.End()
 		t2 := time.Now()
-		if hits, err := s.qd.Search(vecCtx, vecs[0], filters, s.rerankN); err == nil {
+		if hits, err := s.qd.Search(vecCtx, v, filters, s.rerankN); err == nil {
 			for _, h := range hits {
 				vecIDs = append(vecIDs, h.DocID)
 			}
@@ -297,7 +321,7 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.reqTO)
 	defer cancel()
 	start := time.Now()
-	sources, err := s.retrieve(ctx, req.Query, req.Filters, req.TopK)
+	sources, err := s.retrieve(ctx, req.Query, req.Filters, req.TopK, nil)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -324,7 +348,10 @@ func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// tenant is part of req.Filters, so the cache key is naturally per-tenant.
-	key := cache.Key(req.Query, req.Filters)
+	// Fold in the tenant's cache generation: any indexed write bumps it, which
+	// makes prior keys unreachable (freshness-safe caching).
+	gen := s.cache.Generation(ctx, tenant)
+	key := cache.Key(req.Query, req.Filters, gen)
 	var cached map[string]any
 	if s.cache.Get(ctx, key, &cached) {
 		obs.CacheHits.Inc()
@@ -334,7 +361,29 @@ func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 	obs.CacheMisses.Inc()
 
-	sources, err := s.retrieve(ctx, req.Query, req.Filters, req.TopK)
+	// Embed the query once — reused for the semantic-cache lookup and vector retrieval.
+	var qvec []float32
+	if vecs, _, err := s.ml.Embed(ctx, []string{req.Query}); err == nil && len(vecs) > 0 {
+		qvec = vecs[0]
+	}
+
+	// Semantic cache: a paraphrase of an earlier question (same tenant + generation)
+	// above the cosine threshold returns the stored answer without re-generating.
+	if qvec != nil {
+		if aj, score, hit := s.sem.Lookup(ctx, qvec, tenant, gen); hit {
+			obs.CacheHits.Inc()
+			var cachedResp map[string]any
+			if json.Unmarshal([]byte(aj), &cachedResp) == nil {
+				cachedResp["cached"] = true
+				cachedResp["semantic"] = true
+				cachedResp["semantic_score"] = score
+				writeJSON(w, http.StatusOK, cachedResp)
+				return
+			}
+		}
+	}
+
+	sources, err := s.retrieve(ctx, req.Query, req.Filters, req.TopK, qvec)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -359,8 +408,8 @@ func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, faithSp := tracer.Start(ctx, "faithfulness")
-	f := rag.Faithfulness(ans.Text, sources)
+	faithCtx, faithSp := tracer.Start(ctx, "faithfulness", trace.WithAttributes(attribute.String("faithfulness.mode", s.faithMode)))
+	f := rag.ScoreFaithfulness(faithCtx, s.faithMode, s.llm, ans.Text, sources)
 	faithSp.SetAttributes(attribute.Float64("faithfulness.score", f.Score))
 	faithSp.End()
 	obs.RagFaithfulness.Observe(f.Score)
@@ -377,11 +426,24 @@ func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		resp["warning"] = "faithfulness below threshold"
 	}
 	s.cache.Set(ctx, key, resp)
+	if qvec != nil {
+		if b, err := json.Marshal(resp); err == nil {
+			s.sem.Store(ctx, qvec, tenant, gen, string(b))
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func markerFor(n int) string {
 	return "doc_" + strconv.Itoa(n)
+}
+
+// probeDim asks the ML service for the embedding dimension (fallback 768).
+func probeDim(ctx context.Context, mlc *mlclient.Client) int {
+	if vecs, _, err := mlc.Embed(ctx, []string{"probe"}); err == nil && len(vecs) > 0 {
+		return len(vecs[0])
+	}
+	return 768
 }
 
 // runHealthcheck probes the local /health endpoint and exits (0 = healthy).
