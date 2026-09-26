@@ -2,6 +2,9 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
 prometheus-client==0.21.1
+opentelemetry-sdk==1.29.0
+opentelemetry-exporter-otlp-proto-grpc==1.29.0
+opentelemetry-instrumentation-fastapi==0.50b0
 # Optional real-model backends (image installs them; runtime falls back to hash/lexical
 # if EMBED_BACKEND/RERANK_BACKEND=auto and the model can't load).
 sentence-transformers==3.3.1

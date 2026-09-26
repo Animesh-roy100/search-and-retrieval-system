@@ -25,7 +25,15 @@ import (
 	"github.com/animeshroy/search-and-retrieval-system/internal/qdrant"
 	"github.com/animeshroy/search-and-retrieval-system/internal/rag"
 	"github.com/animeshroy/search-and-retrieval-system/internal/retrieve"
+	"github.com/animeshroy/search-and-retrieval-system/internal/tracing"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// tracer resolves the global provider lazily, so package-level init is safe.
+var tracer = tracing.Tracer("query")
 
 type server struct {
 	os       *opensearch.Client
@@ -112,6 +120,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTracing, err := tracing.Init(ctx, "query")
+	if err != nil {
+		log.Printf("query: tracing init: %v", err)
+	}
+	defer func() { _ = shutdownTracing(context.Background()) }()
+
 	var ready atomic.Bool
 	ready.Store(true)
 	go func() {
@@ -126,7 +140,13 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// otelhttp creates a server span per request (named by method+path) and extracts
+	// any inbound trace context, rooting the whole request trace.
+	handler := otelhttp.NewHandler(mux, "query",
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method + " " + r.URL.Path
+		}))
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()) }()
 	log.Printf("query: listening on %s", addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -142,6 +162,9 @@ type askReq struct {
 
 // retrieve runs hybrid retrieval and returns ordered doc ids + assembled docs.
 func (s *server) retrieve(ctx context.Context, query string, filters map[string]string, topK int) ([]rag.Source, error) {
+	ctx, span := tracer.Start(ctx, "retrieve")
+	defer span.End()
+
 	// 1) & 2) Run the lexical and vector lanes concurrently. BM25 needs only the raw
 	// query, so it runs immediately; the vector lane first embeds the query. Each lane
 	// degrades independently (BM25-only if the embed/Qdrant is down, vector-only if
@@ -152,6 +175,8 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		ctx, sp := tracer.Start(ctx, "bm25")
+		defer sp.End()
 		t1 := time.Now()
 		if hits, err := s.os.Search(ctx, query, filters, s.rerankN); err == nil {
 			for _, h := range hits {
@@ -166,15 +191,19 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		embCtx, embSp := tracer.Start(ctx, "embed")
 		t0 := time.Now()
-		vecs, _, err := s.ml.Embed(ctx, []string{query})
+		vecs, _, err := s.ml.Embed(embCtx, []string{query})
 		obs.SearchStageLatency.WithLabelValues("embed").Observe(time.Since(t0).Seconds())
+		embSp.End()
 		if err != nil || len(vecs) == 0 {
 			log.Printf("query: embed failed, degrading to BM25-only: %v", err)
 			return
 		}
+		vecCtx, vecSp := tracer.Start(ctx, "vector")
+		defer vecSp.End()
 		t2 := time.Now()
-		if hits, err := s.qd.Search(ctx, vecs[0], filters, s.rerankN); err == nil {
+		if hits, err := s.qd.Search(vecCtx, vecs[0], filters, s.rerankN); err == nil {
 			for _, h := range hits {
 				vecIDs = append(vecIDs, h.DocID)
 			}
@@ -185,6 +214,7 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 	}()
 
 	wg.Wait()
+	span.SetAttributes(attribute.Int("bm25.hits", len(bm25IDs)), attribute.Int("vector.hits", len(vecIDs)))
 
 	// 3) RRF fuse.
 	fused := retrieve.RRF([][]string{bm25IDs, vecIDs}, s.rrfK)
@@ -222,13 +252,15 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 	for i := range order {
 		order[i] = i
 	}
+	rerankCtx, rerankSp := tracer.Start(ctx, "rerank")
 	t3 := time.Now()
-	if _, ord, err := s.ml.Rerank(ctx, query, texts); err == nil && len(ord) == len(haveIDs) {
+	if _, ord, err := s.ml.Rerank(rerankCtx, query, texts); err == nil && len(ord) == len(haveIDs) {
 		order = ord
 	} else if err != nil {
 		log.Printf("query: rerank skipped: %v", err)
 	}
 	obs.SearchStageLatency.WithLabelValues("rerank").Observe(time.Since(t3).Seconds())
+	rerankSp.End()
 
 	// 6) build ranked sources, cap at topK.
 	if topK <= 0 {
@@ -314,9 +346,11 @@ func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	genCtx, genSp := tracer.Start(ctx, "generate", trace.WithAttributes(attribute.String("llm.provider", s.llm.Name())))
 	tg := time.Now()
-	ans, err := s.llm.Generate(ctx, req.Query, sources)
+	ans, err := s.llm.Generate(genCtx, req.Query, sources)
 	obs.SearchStageLatency.WithLabelValues("generate").Observe(time.Since(tg).Seconds())
+	genSp.End()
 	if err != nil {
 		// LLM down -> return retrieved docs, no generated answer (graceful).
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -325,7 +359,10 @@ func (s *server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, faithSp := tracer.Start(ctx, "faithfulness")
 	f := rag.Faithfulness(ans.Text, sources)
+	faithSp.SetAttributes(attribute.Float64("faithfulness.score", f.Score))
+	faithSp.End()
 	obs.RagFaithfulness.Observe(f.Score)
 
 	resp := map[string]any{

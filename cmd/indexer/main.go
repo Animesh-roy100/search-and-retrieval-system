@@ -23,7 +23,12 @@ import (
 	"github.com/animeshroy/search-and-retrieval-system/internal/obs"
 	"github.com/animeshroy/search-and-retrieval-system/internal/opensearch"
 	"github.com/animeshroy/search-and-retrieval-system/internal/qdrant"
+	"github.com/animeshroy/search-and-retrieval-system/internal/tracing"
+
+	"go.opentelemetry.io/otel/attribute"
 )
+
+var tracer = tracing.Tracer("indexer")
 
 type indexer struct {
 	os     *opensearch.Client
@@ -58,6 +63,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, "indexer")
+	if err != nil {
+		log.Printf("indexer: tracing init: %v", err)
+	}
+	defer func() { _ = shutdownTracing(context.Background()) }()
 
 	// Wait for dependencies and set up schema (idempotent).
 	mustReady(ctx, "opensearch", osc.Health)
@@ -169,6 +180,10 @@ func (ix *indexer) runLane(ctx context.Context, brokers []string, group, topic s
 
 // apply runs the idempotency guard, embeds upserts, and bulk-writes both sinks.
 func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier string) error {
+	ctx, span := tracer.Start(ctx, "index.batch")
+	defer span.End()
+	span.SetAttributes(attribute.String("tier", tier), attribute.Int("batch.size", len(docs)))
+
 	// 1) Idempotency: keep only the newest version per doc, and only if newer than stored.
 	newestByDoc := map[string]contract.CanonicalDoc{}
 	for _, d := range docs {
@@ -193,8 +208,11 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 	// stale writes are rejected (409) here; the returned set is the docs actually
 	// applied, and only those are propagated to Qdrant. This keeps the two stores
 	// consistent even when the in-memory guard is empty (restart / group rebalance).
+	osCtx, osSp := tracer.Start(ctx, "opensearch.bulk")
 	t0 := time.Now()
-	applied, err := ix.os.Bulk(ctx, toApply)
+	applied, err := ix.os.Bulk(osCtx, toApply)
+	osSp.SetAttributes(attribute.Int("applied", len(applied)))
+	osSp.End()
 	if err != nil {
 		return err
 	}
@@ -237,17 +255,22 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 		}
 	}
 
+	qdCtx, qdSp := tracer.Start(ctx, "qdrant.write")
+	qdSp.SetAttributes(attribute.Int("upserts", len(points)), attribute.Int("deletes", len(deletes)))
 	t1 := time.Now()
 	if len(points) > 0 {
-		if err := ix.qd.Upsert(ctx, points); err != nil {
+		if err := ix.qd.Upsert(qdCtx, points); err != nil {
+			qdSp.End()
 			return err
 		}
 	}
 	if len(deletes) > 0 {
-		if err := ix.qd.DeleteByDocIDs(ctx, deletes); err != nil {
+		if err := ix.qd.DeleteByDocIDs(qdCtx, deletes); err != nil {
+			qdSp.End()
 			return err
 		}
 	}
+	qdSp.End()
 	obs.BulkWriteSeconds.WithLabelValues("qdrant").Observe(time.Since(t1).Seconds())
 
 	// 4) Commit guard + observe freshness lag per applied doc.

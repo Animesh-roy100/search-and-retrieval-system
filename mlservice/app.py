@@ -8,6 +8,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import os
 from typing import List
 
 from fastapi import FastAPI
@@ -19,6 +20,31 @@ from reranker import build_reranker
 
 app = FastAPI(title="ml-service", version="1.0.0")
 app.mount("/metrics", make_asgi_app())
+
+
+def _init_tracing(app: FastAPI) -> None:
+    """Wire OTel tracing when an OTLP endpoint is configured; no-op otherwise.
+
+    FastAPIInstrumentor extracts the inbound W3C traceparent (sent by the Go
+    query/indexer otelhttp client), so /embed and /rerank spans join the caller's
+    distributed trace rather than starting a new one.
+    """
+    if not os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        return
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    provider = TracerProvider(resource=Resource.create({"service.name": "mlservice"}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+    FastAPIInstrumentor.instrument_app(app)
+
+
+_init_tracing(app)
 
 EMBED_LAT = Histogram("ml_embed_seconds", "Embedding latency")
 RERANK_LAT = Histogram("ml_rerank_seconds", "Rerank latency")
