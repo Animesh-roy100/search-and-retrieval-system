@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type Client struct {
@@ -16,7 +18,12 @@ type Client struct {
 }
 
 func New(base string) *Client {
-	return &Client{base: base, hc: &http.Client{Timeout: 30 * time.Second}}
+	// otelhttp transport creates a client span per call and injects the W3C
+	// traceparent header, so ML-service spans join the caller's trace.
+	return &Client{base: base, hc: &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}}
 }
 
 type embedReq struct {
