@@ -186,6 +186,11 @@ services:
   # --- observability ---
   prometheus:
     image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Receive Tempo's service-graph / span metrics via remote_write.
+      - --web.enable-remote-write-receiver
+      - --enable-feature=exemplar-storage
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports: ["9090:9090"]
