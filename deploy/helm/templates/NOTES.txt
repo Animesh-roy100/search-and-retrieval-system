@@ -1,0 +1,36 @@
+search-and-retrieval installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  infra      postgres, redpanda, connect (Debezium), opensearch, qdrant, redis
+  ml/llm     mlservice{{ if .Values.litellm.enabled }}, litellm{{ end }}{{ if .Values.ollama.enabled }}, ollama ({{ .Values.ollama.model }}){{ end }}{{ if .Values.tei.enabled }}, tei-embed, tei-rerank{{ end }}
+  app        normalizer, indexer, query
+  observ.    {{ if .Values.observability.enabled }}prometheus, tempo, grafana{{ else }}disabled{{ end }}
+
+1) Watch it come up:
+   kubectl -n {{ .Release.Namespace }} get pods -w
+
+2) The Debezium connector is registered automatically by a post-install Job
+   (register-connector). Check it:
+   kubectl -n {{ .Release.Namespace }} logs job/register-connector
+
+3) Reach the query API:
+{{- if .Values.ingress.enabled }}
+   Add to /etc/hosts:  <node-ip>  {{ .Values.ingress.queryHost }} {{ .Values.ingress.grafanaHost }}
+   curl -X POST http://{{ .Values.ingress.queryHost }}/ask -H 'content-type: application/json' \
+     -d '{"query":"How does Debezium capture changes from PostgreSQL?"}'
+{{- else }}
+   kubectl -n {{ .Release.Namespace }} port-forward svc/query 8080:8080
+   curl -X POST http://localhost:8080/ask -H 'content-type: application/json' \
+     -d '{"query":"How does Debezium capture changes from PostgreSQL?"}'
+{{- end }}
+
+LLM: provider = "{{ .Values.query.llmProvider }}"{{ if .Values.query.llmModel }}, model = "{{ .Values.query.llmModel }}"{{ end }}.
+{{- if and (eq .Values.query.llmProvider "litellm") (not .Values.litellm.enabled) }}
+
+  WARNING: query.llmProvider=litellm but litellm.enabled=false. Set litellm.enabled=true
+  (and ollama.enabled=true for a keyless local model, with query.llmModel=local).
+{{- end }}
+
+IMPORTANT — app images: this chart references YOUR built images
+  {{ .Values.global.appRegistry }}/srs-{normalizer,indexer,query,mlservice}:{{ .Values.global.appTag }}
+Build + push them, or import into k3s. See deploy/helm/README.md.

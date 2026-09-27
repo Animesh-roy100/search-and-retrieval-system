@@ -1,0 +1,120 @@
+# Values for the search-and-retrieval umbrella chart.
+# Self-contained: infra + app in one chart. Toggle optional/heavy components.
+# K3s notes: default storageClass "local-path" and ingressClassName "traefik" match a
+# stock K3s install. This targets a SINGLE amd64 node with ~16GB RAM.
+
+global:
+  storageClass: local-path        # K3s default dynamic provisioner
+  imagePullPolicy: IfNotPresent
+  # Registry/prefix for YOUR built app images (see NOTES). Build + push, or import into
+  # k3s with: `docker save img | sudo k3s ctr images import -`.
+  appRegistry: "ghcr.io/animesh-roy100"
+  appTag: "latest"
+
+ingress:
+  enabled: true
+  className: traefik              # K3s default
+  queryHost: query.srs.local      # add to /etc/hosts -> node IP, or set to your domain
+  grafanaHost: grafana.srs.local
+
+# ---------------------------------------------------------------- infrastructure
+postgres:
+  image: postgres:16
+  storage: 5Gi
+  resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 512Mi } }
+
+redpanda:
+  image: redpandadata/redpanda:v24.2.7
+  storage: 5Gi
+  resources: { requests: { cpu: 250m, memory: 1Gi }, limits: { cpu: "1", memory: 1500Mi } }
+
+connect:  # Debezium Kafka Connect
+  image: debezium/connect:2.7.3.Final
+  resources: { requests: { cpu: 100m, memory: 512Mi }, limits: { cpu: "1", memory: 1Gi } }
+
+opensearch:
+  image: opensearchproject/opensearch:2.17.1
+  storage: 5Gi
+  javaOpts: "-Xms512m -Xmx512m"
+  resources: { requests: { cpu: 250m, memory: 1Gi }, limits: { cpu: "1", memory: 1500Mi } }
+
+qdrant:
+  image: qdrant/qdrant:v1.19.1
+  storage: 5Gi
+  resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
+
+redis:
+  image: redis:7-alpine
+  resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 500m, memory: 256Mi } }
+
+# ---------------------------------------------------------------- ML / LLM
+mlservice:
+  image: "{registry}/srs-mlservice:{tag}"   # {registry}/{tag} are substituted from global
+  embedBackend: hash            # hash|auto (auto = real sentence-transformers, needs the full image)
+  rerankBackend: lexical        # lexical|auto
+  resources: { requests: { cpu: 250m, memory: 512Mi }, limits: { cpu: "2", memory: 2Gi } }
+
+tei:                            # Hugging Face Text-Embeddings-Inference (amd64 only)
+  enabled: false
+  image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+  embedModel: sentence-transformers/all-mpnet-base-v2
+  rerankModel: cross-encoder/ms-marco-MiniLM-L-6-v2
+  storage: 10Gi
+
+litellm:                        # OpenAI-compatible proxy over all LLM providers
+  enabled: false                # enable to use a real LLM (needs the LiteLLM-capable query image)
+  image: ghcr.io/berriai/litellm:main-stable
+  masterKey: sk-local
+  resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 512Mi } }
+
+ollama:                         # fully-local, keyless LLM (heavy on CPU)
+  enabled: false
+  image: ollama/ollama:latest
+  model: llama3.2:3b            # pulled by a post-install Job
+  storage: 10Gi
+  resources: { requests: { cpu: 500m, memory: 2Gi }, limits: { cpu: "4", memory: 6Gi } }
+
+# LLM provider keys (only needed for cloud models via LiteLLM). Prefer setting these with
+# --set-string or a pre-created Secret; do NOT commit real keys.
+secrets:
+  geminiApiKey: ""
+  anthropicApiKey: ""
+  openaiApiKey: ""
+
+# ---------------------------------------------------------------- app (your services)
+normalizer:
+  image: "{registry}/srs-normalizer:{tag}"
+  replicas: 1
+  resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 500m, memory: 256Mi } }
+
+indexer:
+  image: "{registry}/srs-indexer:{tag}"
+  replicas: 1
+  resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { cpu: "2", memory: 1Gi } }
+  hpa: { enabled: true, minReplicas: 1, maxReplicas: 6, targetCPUUtilizationPercentage: 70 }
+
+query:
+  image: "{registry}/srs-query:{tag}"
+  replicas: 2
+  llmProvider: extractive       # extractive (keyless) | litellm (set litellm.enabled + a model)
+  llmModel: ""                  # e.g. "local" (ollama) or "gemini-flash" (needs a key)
+  faithfulnessMode: lexical     # lexical | llm
+  semCache: "true"
+  semCacheThreshold: "0.95"
+  requestTimeout: "5s"          # bump (e.g. 180s) for local/CPU LLM generation
+  apiKey: ""                    # QUERY_API_KEY; set to require auth + enforce tenant isolation
+  resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { cpu: "2", memory: 1Gi } }
+  hpa: { enabled: true, minReplicas: 2, maxReplicas: 8, targetCPUUtilizationPercentage: 70 }
+
+# ---------------------------------------------------------------- observability
+observability:
+  enabled: true
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 512Mi } }
+  tempo:
+    image: grafana/tempo:2.6.1
+    resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 512Mi } }
+  grafana:
+    image: grafana/grafana:11.3.0
+    resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { cpu: 500m, memory: 512Mi } }

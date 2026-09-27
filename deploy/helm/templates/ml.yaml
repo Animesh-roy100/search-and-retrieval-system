@@ -1,0 +1,196 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-keys
+type: Opaque
+stringData:
+  GEMINI_API_KEY: {{ .Values.secrets.geminiApiKey | quote }}
+  ANTHROPIC_API_KEY: {{ .Values.secrets.anthropicApiKey | quote }}
+  OPENAI_API_KEY: {{ .Values.secrets.openaiApiKey | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlservice
+  labels: {{- include "srs.labels" "mlservice" | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mlservice } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "mlservice" | nindent 8 }}
+    spec:
+      containers:
+        - name: mlservice
+          image: {{ include "srs.image" (dict "ctx" $ "image" .Values.mlservice.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - { name: EMBED_BACKEND, value: {{ .Values.mlservice.embedBackend | quote }} }
+            - { name: RERANK_BACKEND, value: {{ .Values.mlservice.rerankBackend | quote }} }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "{{ if .Values.observability.enabled }}http://tempo:4317{{ end }}" }
+            - { name: OTEL_EXPORTER_OTLP_INSECURE, value: "true" }
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.mlservice.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlservice
+  labels: {{- include "srs.labels" "mlservice" | nindent 4 }}
+spec:
+  selector: { app: mlservice }
+  ports: [{ name: http, port: 8000, targetPort: 8000 }]
+{{- if .Values.litellm.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  labels: {{- include "srs.labels" "litellm" | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: litellm } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "litellm" | nindent 8 }}
+    spec:
+      containers:
+        - name: litellm
+          image: {{ .Values.litellm.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args: ["--config", "/app/config.yaml", "--port", "4000"]
+          env:
+            - { name: LITELLM_MASTER_KEY, value: {{ .Values.litellm.masterKey | quote }} }
+          envFrom:
+            - secretRef: { name: llm-keys }
+          ports: [{ containerPort: 4000 }]
+          volumeMounts:
+            - { name: config, mountPath: /app/config.yaml, subPath: config.yaml }
+          readinessProbe:
+            httpGet: { path: /health/liveliness, port: 4000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - { name: config, configMap: { name: litellm-config } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  labels: {{- include "srs.labels" "litellm" | nindent 4 }}
+spec:
+  selector: { app: litellm }
+  ports: [{ name: http, port: 4000, targetPort: 4000 }]
+{{- end }}
+{{- if .Values.ollama.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.global.storageClass }}
+  resources: { requests: { storage: {{ .Values.ollama.storage }} } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  labels: {{- include "srs.labels" "ollama" | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: ollama } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "ollama" | nindent 8 }}
+    spec:
+      containers:
+        - name: ollama
+          image: {{ .Values.ollama.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports: [{ containerPort: 11434 }]
+          volumeMounts:
+            - { name: models, mountPath: /root/.ollama }
+          readinessProbe:
+            httpGet: { path: /api/tags, port: 11434 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.ollama.resources | nindent 12 }}
+      volumes:
+        - { name: models, persistentVolumeClaim: { claimName: ollama-models } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  labels: {{- include "srs.labels" "ollama" | nindent 4 }}
+spec:
+  selector: { app: ollama }
+  ports: [{ name: http, port: 11434, targetPort: 11434 }]
+---
+# Pull the model once Ollama is up (idempotent).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-pull
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata: { labels: { app: ollama-pull } }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: pull
+          image: curlimages/curl:8.10.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              until curl -sf http://ollama:11434/api/tags >/dev/null; do sleep 3; done
+              curl -sf -X POST http://ollama:11434/api/pull -d '{"model":"{{ .Values.ollama.model }}"}'
+{{- end }}
+{{- if .Values.tei.enabled }}
+{{- range $svc := list "embed" "rerank" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei-{{ $svc }}
+  labels: {{- include "srs.labels" (printf "tei-%s" $svc) | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tei-{{ $svc }} } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" (printf "tei-%s" $svc) | nindent 8 }}
+    spec:
+      nodeSelector: { kubernetes.io/arch: amd64 }
+      containers:
+        - name: tei
+          image: {{ $.Values.tei.image }}
+          args: ["--model-id", "{{ if eq $svc "embed" }}{{ $.Values.tei.embedModel }}{{ else }}{{ $.Values.tei.rerankModel }}{{ end }}", "--port", "80"]
+          ports: [{ containerPort: 80 }]
+          volumeMounts: [{ name: cache, mountPath: /data }]
+      volumes: [{ name: cache, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tei-{{ $svc }}
+  labels: {{- include "srs.labels" (printf "tei-%s" $svc) | nindent 4 }}
+spec:
+  selector: { app: tei-{{ $svc }} }
+  ports: [{ name: http, port: 80, targetPort: 80 }]
+{{- end }}
+{{- end }}

@@ -1,0 +1,139 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redpanda-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.global.storageClass }}
+  resources: { requests: { storage: {{ .Values.redpanda.storage }} } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redpanda
+  labels: {{- include "srs.labels" "redpanda" | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: redpanda } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "redpanda" | nindent 8 }}
+    spec:
+      containers:
+        - name: redpanda
+          image: {{ .Values.redpanda.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args:
+            - redpanda
+            - start
+            - --overprovisioned
+            - --smp=1
+            - --memory=1G
+            - --reserve-memory=0M
+            - --node-id=0
+            - --check=false
+            - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+            - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://redpanda:9092
+          ports:
+            - { containerPort: 29092 }
+            - { containerPort: 9092 }
+            - { containerPort: 9644 }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/redpanda/data }
+          readinessProbe:
+            exec: { command: ["/bin/sh", "-c", "rpk cluster health | grep -q 'Healthy:.*true'"] }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources: {{- toYaml .Values.redpanda.resources | nindent 12 }}
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: redpanda-data } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  labels: {{- include "srs.labels" "redpanda" | nindent 4 }}
+spec:
+  selector: { app: redpanda }
+  ports:
+    - { name: internal, port: 29092, targetPort: 29092 }
+    - { name: outside, port: 9092, targetPort: 9092 }
+    - { name: admin, port: 9644, targetPort: 9644 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connect
+  labels: {{- include "srs.labels" "connect" | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: connect } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "connect" | nindent 8 }}
+    spec:
+      containers:
+        - name: connect
+          image: {{ .Values.connect.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - { name: BOOTSTRAP_SERVERS, value: "redpanda:29092" }
+            - { name: GROUP_ID, value: "connect-cluster" }
+            - { name: CONFIG_STORAGE_TOPIC, value: "connect_configs" }
+            - { name: OFFSET_STORAGE_TOPIC, value: "connect_offsets" }
+            - { name: STATUS_STORAGE_TOPIC, value: "connect_statuses" }
+            - { name: KEY_CONVERTER, value: "org.apache.kafka.connect.json.JsonConverter" }
+            - { name: VALUE_CONVERTER, value: "org.apache.kafka.connect.json.JsonConverter" }
+            - { name: CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE, value: "false" }
+            - { name: CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE, value: "false" }
+          ports: [{ containerPort: 8083 }]
+          readinessProbe:
+            httpGet: { path: /connectors, port: 8083 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources: {{- toYaml .Values.connect.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: connect
+  labels: {{- include "srs.labels" "connect" | nindent 4 }}
+spec:
+  selector: { app: connect }
+  ports: [{ name: rest, port: 8083, targetPort: 8083 }]
+---
+# Register the Debezium connector once Connect is up (idempotent; tolerates 409).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: register-connector
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 20
+  template:
+    metadata: { labels: { app: register-connector } }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: register
+          image: curlimages/curl:8.10.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "waiting for connect..."
+              until curl -sf http://connect:8083/connectors >/dev/null; do sleep 3; done
+              code=$(curl -s -o /tmp/o -w '%{http_code}' -X POST http://connect:8083/connectors \
+                -H 'Content-Type: application/json' --data @/config/connector.json)
+              echo "register status: $code"; cat /tmp/o || true
+              # 201 created, 409 already exists -> both fine
+              [ "$code" = "201" ] || [ "$code" = "409" ]
+          volumeMounts:
+            - { name: cfg, mountPath: /config }
+      volumes:
+        - { name: cfg, configMap: { name: debezium-connector } }
