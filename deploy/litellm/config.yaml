@@ -1,0 +1,24 @@
+# LiteLLM proxy config — one OpenAI-compatible endpoint over many providers.
+# Provider API keys come from env. Add Ollama/vLLM/OpenAI entries here to expose more
+# models with zero app changes (the Go client just sends a different `model` name).
+model_list:
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-3.8-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: claude-haiku
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  # Fully-local, keyless model via the Ollama service (no provider quotas).
+  # Pull it once:  docker compose exec ollama ollama pull llama3.2:3b
+  - model_name: local
+    litellm_params:
+      model: ollama_chat/llama3.2:3b
+      api_base: http://ollama:11434
+
+litellm_settings:
+  drop_params: true # silently drop params a given provider doesn't support
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

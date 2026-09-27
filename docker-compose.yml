@@ -141,6 +141,28 @@ services:
     volumes: ["hf-cache:/data"]
     ports: ["8082:80"]
 
+  # LiteLLM proxy — OpenAI-compatible endpoint over all LLM providers. The query
+  # service uses it when LLM_PROVIDER=litellm; provider keys come from env. Multi-arch
+  # image (runs natively on arm64). No DB needed for basic proxying.
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes: ["./deploy/litellm/config.yaml:/app/config.yaml:ro"]
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local}
+    ports: ["4000:4000"]
+
+  # Ollama — fully local, keyless LLM (no provider quotas). LiteLLM's `local` model
+  # routes here. Pull a model after start:  docker compose exec ollama ollama pull llama3.2:3b
+  # (multi-arch image; CPU inference in Docker on Mac — use a small model).
+  ollama:
+    image: ollama/ollama:latest
+    volumes: ["ollama-models:/root/.ollama"]
+    ports: ["11434:11434"]
+
   normalizer:
     build:
       context: .
@@ -206,9 +228,10 @@ services:
       METRICS_ADDR: ":9102"
       LLM_PROVIDER: ${LLM_PROVIDER:-extractive}
       LLM_MODEL: ${LLM_MODEL:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      LITELLM_URL: ${LITELLM_URL:-http://litellm:4000}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-local}
       FAITHFULNESS_MODE: ${FAITHFULNESS_MODE:-lexical}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-5s}
       SEM_CACHE: ${SEM_CACHE:-true}
       SEM_CACHE_THRESHOLD: ${SEM_CACHE_THRESHOLD:-0.95}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4317}
@@ -252,3 +275,4 @@ services:
 
 volumes:
   hf-cache: {}
+  ollama-models: {}

@@ -42,18 +42,14 @@ type Provider interface {
 }
 
 // NewProvider selects a provider from env. Default is the deterministic extractive
-// provider so the stack is self-contained; set LLM_PROVIDER=anthropic|gemini with the
-// matching API key to use a real model. Falls back to extractive if the key is missing.
+// provider so the stack is self-contained (no API key). Set LLM_PROVIDER=litellm +
+// LITELLM_URL to use any real model via the LiteLLM proxy (OpenAI/Anthropic/Gemini/
+// Ollama/vLLM). Falls back to extractive if not configured.
 func NewProvider() Provider {
 	switch strings.ToLower(os.Getenv("LLM_PROVIDER")) {
-	case "anthropic":
-		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-			return NewAnthropic(key, os.Getenv("LLM_MODEL"))
-		}
-		fallthrough
-	case "gemini":
-		if key := os.Getenv("GEMINI_API_KEY"); key != "" {
-			return NewGemini(key, os.Getenv("LLM_MODEL"))
+	case "litellm":
+		if url := os.Getenv("LITELLM_URL"); url != "" {
+			return NewLiteLLM(url, os.Getenv("LITELLM_API_KEY"), os.Getenv("LLM_MODEL"))
 		}
 		fallthrough
 	default:
