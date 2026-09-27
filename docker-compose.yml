@@ -220,8 +220,6 @@ services:
       METRICS_ADDR: ":9102"
       LLM_PROVIDER: ${LLM_PROVIDER:-extractive}
       LLM_MODEL: ${LLM_MODEL:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       LITELLM_URL: ${LITELLM_URL:-http://litellm:4000}
       LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-local}
       FAITHFULNESS_MODE: ${FAITHFULNESS_MODE:-lexical}
