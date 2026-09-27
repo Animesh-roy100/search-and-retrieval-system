@@ -35,8 +35,55 @@ make down    # tear everything down
 
 Requirements: Docker + Docker Compose. Nothing else is needed on the host — Go and
 Python build inside containers. No external API key is required: the RAG layer ships
-with a deterministic grounded provider by default (set `LLM_PROVIDER=anthropic` and
-`ANTHROPIC_API_KEY=…` to use a real model).
+with a deterministic grounded provider by default (set `LLM_PROVIDER=anthropic|gemini`
+and the matching API key to use a real model).
+
+## Measured results
+
+From a local docker-compose run with **real models** —
+`sentence-transformers/all-mpnet-base-v2` embeddings, a `ms-marco-MiniLM-L-6-v2`
+cross-encoder reranker (CPU), and **Google Gemini** for generation + the LLM
+faithfulness judge. Honest single-node CPU numbers, with bottlenecks called out.
+
+**Retrieval / embedding quality (mpnet)**
+
+| Signal | Value |
+|---|---|
+| Paraphrase cosine (semantically-equivalent queries) | **0.90** |
+| Unrelated-query cosine | **0.03** |
+| Semantic cache — cross-paraphrase hit (never-seen query) | **hit @ 0.91** (threshold 0.88) |
+| Semantic cache — unrelated query | miss (correct) |
+
+**RAG (Gemini `gemini-3.8-flash`)** — grounded answer with a `[doc_1]` citation,
+LLM-judged **faithfulness = 1.0**.
+
+**Throughput & latency (single-node, CPU inference)**
+
+| Metric | Value | Note |
+|---|---|---|
+| Sustained ingest | **101 writes/s** for 2m (12,350 writes) | pipeline keeps up; work queues at the embedder |
+| Search stage p99 — BM25 | **72 ms** | |
+| Search stage p99 — vector (Qdrant) | **25 ms** | |
+| Search stage p99 — query embed | **~1.0 s** | CPU mpnet |
+| Search stage p99 — cross-encoder rerank (top-50) | **~4.9 s** | CPU; dominates search latency |
+| End-to-end `/search` p50 / p99 | **2.5 s / 3.3 s** | rerank-bound |
+| Freshness p99 (urgent) @ 100 writes/s | **~57 s** | embedding-throughput-bound; drains to 0 at rest |
+
+**The honest bottleneck:** with real models on **CPU** the system is
+**inference-bound**, not pipeline-bound. The plumbing is fast (BM25 72 ms, vector
+25 ms); query embedding (~1 s) and especially the cross-encoder rerank (~4.9 s over 50
+candidates) dominate search latency, and at 100 writes/s the CPU embedder can't keep
+pace so an indexing backlog forms and urgent freshness degrades (consumer lag peaked
+~4.4k, then drained to 0 once load stopped). **Mitigations:** GPU inference, more
+indexer replicas (partition-parallel by `doc_id`), larger embed batches, rerank fewer
+candidates / a smaller reranker, async faithfulness. With the deterministic
+embedding/rerank backends (sub-ms) the same 100 writes/s holds urgent freshness p99 in
+the low seconds and `/search` well under a second.
+
+> Retrieval ablation (`make eval`): on the bundled 8-query golden set the corpus is
+> small and topically uniform, so **BM25 already scores nDCG@10 = 1.0** — no headroom
+> to show a rerank lift. A meaningful ablation needs a larger labeled corpus (e.g. a
+> BEIR slice); the harness + metrics are in place for it.
 
 ## Components
 
