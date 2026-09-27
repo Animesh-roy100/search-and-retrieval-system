@@ -117,6 +117,30 @@ services:
       timeout: 3s
       retries: 30
 
+  # Hugging Face Text-Embeddings-Inference — high-throughput Rust inference for
+  # embeddings + cross-encoder reranking. One model per instance. Used when the
+  # query/indexer are pointed at them via TEI_EMBED_URL / TEI_RERANK_URL. Models are
+  # pulled on first start; readiness is handled app-side (mustReady pings /health).
+  #
+  # NOTE: TEI CPU images are published amd64-only. On amd64/GPU hosts this is the
+  # fast path (rerank drops from seconds to tens of ms). On Apple Silicon (arm64)
+  # it runs only under emulation (slow) — there, keep the native Python backend
+  # (unset TEI_* in .env). Swap to a GPU image (e.g. `1.5`) + a `deploy.resources`
+  # GPU reservation on a GPU host for production.
+  tei-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    platform: linux/amd64
+    command: ["--model-id", "${TEI_EMBED_MODEL:-sentence-transformers/all-mpnet-base-v2}", "--port", "80"]
+    volumes: ["hf-cache:/data"]
+    ports: ["8081:80"]
+
+  tei-rerank:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    platform: linux/amd64
+    command: ["--model-id", "${TEI_RERANK_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}", "--port", "80"]
+    volumes: ["hf-cache:/data"]
+    ports: ["8082:80"]
+
   normalizer:
     build:
       context: .
@@ -149,6 +173,8 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6334"
       ML_SERVICE_ADDR: http://mlservice:8000
+      TEI_EMBED_URL: ${TEI_EMBED_URL:-}
+      TEI_RERANK_URL: ${TEI_RERANK_URL:-}
       REDIS_ADDR: redis:6379
       METRICS_ADDR: ":9101"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4317}
@@ -173,6 +199,8 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6334"
       ML_SERVICE_ADDR: http://mlservice:8000
+      TEI_EMBED_URL: ${TEI_EMBED_URL:-}
+      TEI_RERANK_URL: ${TEI_RERANK_URL:-}
       REDIS_ADDR: redis:6379
       QUERY_ADDR: ":8080"
       METRICS_ADDR: ":9102"
@@ -221,3 +249,6 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
     ports: ["3000:3000"]
     depends_on: [prometheus, tempo]
+
+volumes:
+  hf-cache: {}

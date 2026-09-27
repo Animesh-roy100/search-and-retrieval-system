@@ -1,4 +1,6 @@
-// Package mlclient is a thin HTTP client for the Python ML service.
+// Package mlclient talks to an embedding + rerank backend. Two implementations
+// satisfy the ML interface: the project's Python ML service (Client) and Hugging
+// Face Text-Embeddings-Inference (TEI). FromEnv selects TEI when TEI_EMBED_URL is set.
 package mlclient
 
 import (
@@ -7,10 +9,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
+
+// ML is the backend-agnostic surface the indexer and query service depend on.
+type ML interface {
+	Embed(ctx context.Context, texts []string) ([][]float32, string, error)
+	Rerank(ctx context.Context, query string, docs []string) ([]float64, []int, error)
+	Health(ctx context.Context) error
+}
+
+// FromEnv returns a TEI-backed client when TEI_EMBED_URL is set (rerank optional),
+// otherwise the Python ML service at pythonBase.
+func FromEnv(pythonBase string) ML {
+	if embed := os.Getenv("TEI_EMBED_URL"); embed != "" {
+		return NewTEI(embed, os.Getenv("TEI_RERANK_URL"))
+	}
+	return New(pythonBase)
+}
 
 type Client struct {
 	base string

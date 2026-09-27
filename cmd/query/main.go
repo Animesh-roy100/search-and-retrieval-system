@@ -39,7 +39,7 @@ var tracer = tracing.Tracer("query")
 type server struct {
 	os        *opensearch.Client
 	qd        *qdrant.Client
-	ml        *mlclient.Client
+	ml        mlclient.ML
 	cache     *cache.Cache
 	sem       *semcache.Cache
 	llm       rag.Provider
@@ -103,7 +103,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("query: qdrant client: %v", err)
 	}
-	mlc := mlclient.New(config.Str("ML_SERVICE_ADDR", "http://localhost:8000"))
+	mlc := mlclient.FromEnv(config.Str("ML_SERVICE_ADDR", "http://localhost:8000"))
 	c := cache.New(config.Str("REDIS_ADDR", ""), config.Dur("CACHE_TTL", 5*time.Minute))
 	sem, err := semcache.New(
 		config.Str("QDRANT_HOST", "localhost"), config.Int("QDRANT_PORT", 6334),
@@ -439,7 +439,7 @@ func markerFor(n int) string {
 }
 
 // probeDim asks the ML service for the embedding dimension (fallback 768).
-func probeDim(ctx context.Context, mlc *mlclient.Client) int {
+func probeDim(ctx context.Context, mlc mlclient.ML) int {
 	if vecs, _, err := mlc.Embed(ctx, []string{"probe"}); err == nil && len(vecs) > 0 {
 		return len(vecs[0])
 	}
