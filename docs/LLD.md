@@ -1,8 +1,9 @@
 # Low-Level Design (LLD) — Near Real-Time Multi-Source Retrieval + RAG System
 
 > Component internals, data schemas, algorithms, and failure handling.
-> Companion to `HLD.md`. **Rev 2** — multi-source normalizers, canonical doc,
-> priority-tiered ingestion, per-source versioning & freshness.
+> Companion to `HLD.md`. **Rev 3** — implemented v1: OpenSearch-authority idempotency,
+> tenant isolation + auth, generation-invalidated + semantic caching, LLM/lexical
+> faithfulness, and OpenTelemetry tracing + Tempo service graph.
 
 ---
 
@@ -26,11 +27,13 @@ search-and-retrieval-system/
 ├── query/              # Go: query planning + hybrid retrieval + RRF + RAG
 │   ├── internal/plan/         # query understanding & planning (Broker-style)
 │   ├── internal/retrieve/     # bm25, vector, rrf, mmr (source filters)
-│   ├── internal/rag/          # prompt, generate, faithfulness, cite(source)
-│   └── internal/cache/        # semantic cache
+│   ├── internal/rag/          # prompt, generate, lexical + llm-judge faithfulness, cite(source)
+│   ├── internal/cache/        # Redis exact-match cache + per-tenant generation counter
+│   └── internal/semcache/     # Qdrant-backed semantic answer cache (tenant+gen scoped)
+├── internal/tracing/   # shared OpenTelemetry OTLP setup + W3C propagation (Go services)
 ├── eval/               # Python: nDCG/MRR/recall + faithfulness eval
 ├── kafka/              # Redpanda + Debezium connector config + compose
-├── deploy/             # docker-compose + Helm + observability stack
+├── deploy/             # docker-compose + Helm + observability stack (Prometheus, Tempo, Grafana)
 └── docs/               # HLD.md, LLD.md
 ```
 
@@ -201,18 +204,22 @@ flowchart TD
 
 > Fast lane gets a smaller flush interval (low latency); bulk lane uses larger batches (throughput). Both feed the same idempotent sink.
 
-### 4.2 Per-source idempotency guard
+### 4.2 Idempotency — OpenSearch is the version authority
 
-**Rule:** apply only if `version` is strictly greater than what's stored **for that source**. Versions are not comparable across sources.
+Two layers, so correctness does **not** depend on the volatile in-memory guard:
+
+1. **In-memory guard (optimization):** skip obviously stale in-flight docs (`in.Version > stored`), avoiding wasted embeds. Lost on restart/rebalance — so it cannot be the authority.
+2. **OpenSearch (durable authority):** every write uses `version_type=external`, **including deletes**. A stale upsert or a stale delete (e.g. a DLQ replay) is rejected with `409`. `Bulk` returns the **set of doc_ids actually applied**; Qdrant is written **only for that set**. Result: the two stores stay consistent even when the guard map is empty.
 
 ```go
-func shouldApply(in CanonicalDoc, stored StoredMeta) bool {
-    // stored keyed by doc_id (already source-namespaced)
-    return in.Version > stored.Version
-}
-// Qdrant point_id = UUIDv5(namespace, doc_id) → upsert overwrites
-// OpenSearch _id = doc_id, version_type=external, version=in.Version
+// OpenSearch _bulk: _id = doc_id, version = in.Version, version_type = external
+//   upsert: 2xx = applied · 409 = stale (skip) · other >=400 = hard error (retry)
+//   delete: 2xx = applied · 404 = already-absent (applied, safe) · 409 = stale (skip)
+// Bulk returns applied[doc_id]; the indexer embeds + upserts/deletes Qdrant ONLY for applied docs.
+// Qdrant point_id = UUIDv5(NameSpaceDNS, doc_id)  (google/uuid) → deterministic overwrite.
 ```
+
+Proven by an integration test (`internal/opensearch`, build tag `integration`): index v3 → replay stale v2 upsert and v1 delete → both rejected, doc stays v3; v4 delete applies.
 
 ### 4.3 Delivery & ordering guarantees
 
@@ -220,8 +227,10 @@ func shouldApply(in CanonicalDoc, stored StoredMeta) bool {
 |---|---|
 | Per-doc ordering | Redpanda key = `doc_id` → same partition |
 | At-least-once | commit offsets only after successful bulk write |
-| Idempotent apply | per-source version guard + deterministic IDs |
-| Poison events | DLQ topic after N retries |
+| Idempotent apply | OpenSearch external-version authority (§4.2) + deterministic IDs; Qdrant driven off the applied set |
+| Stale delete safety | deletes are external-versioned too → a replayed old delete can't remove a re-created doc |
+| Poison events | DLQ topic after N retries; benign `404`-on-delete tolerated (does not poison the batch) |
+| Idle-lane flush | each poll is bounded to the flush interval → a low-traffic lane's buffered batch is never stranded |
 | Backpressure | bounded channel; pause fetch when sinks slow |
 | Tier isolation | separate topics; fast lane not blocked by bulk backlog |
 
@@ -251,19 +260,25 @@ DLQ record: original canonical doc, `source`, error, retry count, first-seen ts,
 
 ```mermaid
 flowchart TD
-    Q["query + filters (source, tenant, category)"] --> PLAN["query understanding & planning"]
-    PLAN --> CACHE{"semantic cache hit?"}
-    CACHE -->|yes| RET["return cached"]
-    CACHE -->|no| EMB["embed query"]
-    PLAN --> BM25["OpenSearch BM25 + filters"]
-    EMB --> VEC["Qdrant vector + filters"]
-    BM25 --> RRF["RRF fuse (k=60)"]
-    VEC --> RRF
+    Q["query + server-injected tenant filter"] --> EXACT{"exact-match cache?<br/>(Redis, key includes gen)"}
+    EXACT -->|hit| RET["return cached"]
+    EXACT -->|miss| EMB["embed query (once)"]
+    EMB --> SEM{"semantic cache?<br/>(Qdrant, cosine ≥ θ, tenant+gen)"}
+    SEM -->|hit| RET
+    SEM -->|miss| PAR["BM25 ∥ vector (concurrent)"]
+    PAR --> RRF["RRF fuse (k=60)"]
     RRF --> TOP["top-50 candidates"]
     TOP --> RERANK["cross-encoder rerank"]
     RERANK --> MMR["MMR diversity + dedup"]
     MMR --> OUT["top-k (carry source per doc)"]
 ```
+
+**Caching (two layers, freshness-safe):** an exact-match Redis cache (fast path) and a
+Qdrant-backed **semantic** cache (paraphrase hits above a cosine threshold). Both are
+scoped by `tenant_id` + a per-tenant **generation** counter; the indexer bumps the
+generation on every applied write, so any indexed change makes prior cache entries
+unreachable — no scan, no stale reads. The query is embedded **once** and the vector is
+reused for the semantic lookup and vector retrieval.
 
 ### 6.2 RRF algorithm
 
@@ -334,12 +349,20 @@ Question: {query}
 
 Model routing: `claude-haiku-4-5` simple, `claude-opus-4-8` complex synthesis.
 
-### 7.3 Faithfulness check
+### 7.3 Faithfulness check (`FAITHFULNESS_MODE`)
+
+Two strategies behind one `ScoreFaithfulness` entry point:
+
+- **`lexical` (default):** deterministic token-overlap per sentence (flow below). No API
+  cost; correct calibration for the extractive provider (verbatim answers).
+- **`llm`:** the LLM provider's `JudgeFaithfulness` scores grounding (understands
+  paraphrase/entailment), returning `{score, unsupported[]}`. **Falls back to lexical on
+  any error.** Right calibration for a generative LLM answer.
 
 ```mermaid
 flowchart LR
     A["answer sentences"] --> B["per claim"]
-    B --> C{"supported by any source chunk?"}
+    B --> C{"supported by any source chunk?<br/>(lexical overlap OR llm judge)"}
     C -->|yes| D["keep"]
     C -->|no| E["mark unsupported"]
     D --> F["faithfulness = supported/total"]
@@ -446,10 +469,18 @@ graph LR
     ML["ml /metrics"] --> PROM
     PROM["Prometheus (agent)"] -->|remote_write| CORTEX["Mimir/Cortex"]
     CORTEX --> MINIO[("MinIO")]
-    QRY -->|spans| OTEL["OTel Collector"] --> TEMPO["Tempo"]
+    QRY & IDX & ML -->|OTLP spans| TEMPO["Tempo"]
+    TEMPO -->|service-graph metrics| PROM
     CORTEX & TEMPO --> GRAF["Grafana"]
     PROM --> ALERT["Alertmanager"]
 ```
+
+**Implemented stack:** Prometheus + **Tempo** + Grafana, wired end-to-end. **Distributed
+tracing** (OpenTelemetry, W3C propagation) spans `query → mlservice` on the read path and
+`indexer → mlservice` on the write path — one `/ask` yields a single trace across Go+Python.
+Tempo's metrics-generator emits **service-graph** metrics (`traces_service_graph_*`) to
+Prometheus, rendered as a live topology (nodes = services, edges = call rate/latency/errors)
+in Grafana. Mimir/Cortex + MinIO remain the scale-out option for long-term metric storage.
 
 ---
 
@@ -496,12 +527,18 @@ S3_BUCKET, S3_POLL_INTERVAL, S3_EVENT_QUEUE
 # Indexer
 FAST_FLUSH_MS=200, BULK_FLUSH_MS=2000, BATCH_SIZE, MAX_IN_FLIGHT, BULK_RETRIES
 # Stores
-OPENSEARCH_URL, QDRANT_URL, REDIS_URL
+OPENSEARCH_URL, QDRANT_HOST, QDRANT_PORT, REDIS_ADDR
 # ML
 ML_SERVICE_ADDR, EMBED_MODEL, RERANK_MODEL
 # RAG
 LLM_MODEL_FAST=claude-haiku-4-5, LLM_MODEL_QUALITY=claude-opus-4-8
 FAITHFULNESS_THRESHOLD=0.9, RAG_TOP_K=6, RERANK_TOP_N=50, RRF_K=60
+# Caching (query) + freshness invalidation (indexer bumps gen via REDIS_ADDR)
+CACHE_TTL=5m, SEM_CACHE=true, SEM_CACHE_THRESHOLD=0.95
+# Quality / security / limits (query)
+FAITHFULNESS_MODE=lexical|llm, QUERY_API_KEY, REQUEST_TIMEOUT=5s
+# Tracing (all services) — unset = graceful no-op
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317, OTEL_EXPORTER_OTLP_INSECURE=true
 ```
 
 See `HLD.md` for architecture, NFRs, prior art, and roadmap.
