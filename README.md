@@ -85,6 +85,22 @@ the low seconds and `/search` well under a second.
 > to show a rerank lift. A meaningful ablation needs a larger labeled corpus (e.g. a
 > BEIR slice); the harness + metrics are in place for it.
 
+### Dashboards & traces
+
+![Retrieval + RAG — Freshness & Quality dashboard](docs/img/grafana-freshness-quality.png)
+
+*Grafana dashboard (Prometheus).* Freshness-lag p99 (urgent) climbs to ~1 min during the
+100 writes/s burst then recovers (the CPU embedding backlog); **search-stage latency** is
+dominated by the `rerank` line spiking to ~5s while bm25/vector/embed hug the floor; **RAG
+faithfulness (avg) = 1**; **DLQ events = none** (clean pipeline).
+
+![Tempo service graph and span metrics](docs/img/grafana-service-graph.png)
+
+*OpenTelemetry → Tempo.* The node graph shows the distributed-trace mesh —
+`user → query → mlservice` (read path) and `indexer → mlservice` (write path) converging on
+the Python ML service. Span metrics: `POST /rerank` p90 **2.97s**, `POST /embed` **484ms** —
+visual confirmation that inference (rerank) is the latency bottleneck.
+
 ## Components
 
 | Component | Language | Role |
