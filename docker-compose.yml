@@ -155,6 +155,14 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local}
     ports: ["4000:4000"]
 
+  # Ollama — fully local, keyless LLM (no provider quotas). LiteLLM's `local` model
+  # routes here. Pull a model after start:  docker compose exec ollama ollama pull llama3.2:3b
+  # (multi-arch image; CPU inference in Docker on Mac — use a small model).
+  ollama:
+    image: ollama/ollama:latest
+    volumes: ["ollama-models:/root/.ollama"]
+    ports: ["11434:11434"]
+
   normalizer:
     build:
       context: .
@@ -223,6 +231,7 @@ services:
       LITELLM_URL: ${LITELLM_URL:-http://litellm:4000}
       LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-local}
       FAITHFULNESS_MODE: ${FAITHFULNESS_MODE:-lexical}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-5s}
       SEM_CACHE: ${SEM_CACHE:-true}
       SEM_CACHE_THRESHOLD: ${SEM_CACHE_THRESHOLD:-0.95}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4317}
@@ -266,3 +275,4 @@ services:
 
 volumes:
   hf-cache: {}
+  ollama-models: {}
