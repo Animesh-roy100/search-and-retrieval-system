@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+data:
+  init.sql: |
+{{ .Files.Get "files/init.sql" | indent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: debezium-connector
+data:
+  connector.json: |
+{{ .Files.Get "files/debezium-connector.json" | indent 4 }}
+{{- if .Values.observability.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+{{ .Files.Get "files/prometheus.yml" | indent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+data:
+  tempo.yaml: |
+{{ .Files.Get "files/tempo.yaml" | indent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+data:
+  datasource.yaml: |
+{{ .Files.Get "files/grafana-datasource.yaml" | indent 4 }}
+{{- end }}
+{{- if .Values.litellm.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+data:
+  config.yaml: |
+{{ .Files.Get "files/litellm-config.yaml" | indent 4 }}
+{{- end }}

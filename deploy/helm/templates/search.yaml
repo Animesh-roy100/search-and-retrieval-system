@@ -1,0 +1,107 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: opensearch-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.global.storageClass }}
+  resources: { requests: { storage: {{ .Values.opensearch.storage }} } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensearch
+  labels: {{- include "srs.labels" "opensearch" | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: opensearch } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "opensearch" | nindent 8 }}
+    spec:
+      initContainers:
+        # OpenSearch requires vm.max_map_count >= 262144 on the node.
+        - name: sysctl
+          image: busybox:1.36
+          command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+          securityContext: { privileged: true }
+      containers:
+        - name: opensearch
+          image: {{ .Values.opensearch.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - { name: discovery.type, value: single-node }
+            - { name: DISABLE_SECURITY_PLUGIN, value: "true" }
+            - { name: DISABLE_INSTALL_DEMO_CONFIG, value: "true" }
+            - { name: OPENSEARCH_JAVA_OPTS, value: {{ .Values.opensearch.javaOpts | quote }} }
+          ports: [{ containerPort: 9200 }]
+          volumeMounts:
+            - { name: data, mountPath: /usr/share/opensearch/data }
+          readinessProbe:
+            httpGet: { path: /_cluster/health, port: 9200 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources: {{- toYaml .Values.opensearch.resources | nindent 12 }}
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: opensearch-data } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch
+  labels: {{- include "srs.labels" "opensearch" | nindent 4 }}
+spec:
+  selector: { app: opensearch }
+  ports: [{ name: http, port: 9200, targetPort: 9200 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qdrant-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.global.storageClass }}
+  resources: { requests: { storage: {{ .Values.qdrant.storage }} } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qdrant
+  labels: {{- include "srs.labels" "qdrant" | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: qdrant } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "qdrant" | nindent 8 }}
+    spec:
+      containers:
+        - name: qdrant
+          image: {{ .Values.qdrant.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - { containerPort: 6333 }
+            - { containerPort: 6334 }
+          volumeMounts:
+            - { name: data, mountPath: /qdrant/storage }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 6333 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources: {{- toYaml .Values.qdrant.resources | nindent 12 }}
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: qdrant-data } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  labels: {{- include "srs.labels" "qdrant" | nindent 4 }}
+spec:
+  selector: { app: qdrant }
+  ports:
+    - { name: http, port: 6333, targetPort: 6333 }
+    - { name: grpc, port: 6334, targetPort: 6334 }

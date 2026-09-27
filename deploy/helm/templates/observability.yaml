@@ -1,0 +1,128 @@
+{{- if .Values.observability.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  labels: {{- include "srs.labels" "prometheus" | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: prometheus } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "prometheus" | nindent 8 }}
+    spec:
+      containers:
+        - name: prometheus
+          image: {{ .Values.observability.prometheus.image }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --web.enable-remote-write-receiver
+            - --enable-feature=exemplar-storage
+          ports: [{ containerPort: 9090 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+          resources: {{- toYaml .Values.observability.prometheus.resources | nindent 12 }}
+      volumes:
+        - { name: config, configMap: { name: prometheus-config } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  labels: {{- include "srs.labels" "prometheus" | nindent 4 }}
+spec:
+  selector: { app: prometheus }
+  ports: [{ name: http, port: 9090, targetPort: 9090 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  labels: {{- include "srs.labels" "tempo" | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tempo } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "tempo" | nindent 8 }}
+    spec:
+      containers:
+        - name: tempo
+          image: {{ .Values.observability.tempo.image }}
+          args: ["-config.file=/etc/tempo/tempo.yaml"]
+          ports:
+            - { containerPort: 3200 }
+            - { containerPort: 4317 }
+            - { containerPort: 4318 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/tempo }
+            - { name: data, mountPath: /var/tempo }
+          resources: {{- toYaml .Values.observability.tempo.resources | nindent 12 }}
+      volumes:
+        - { name: config, configMap: { name: tempo-config } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  labels: {{- include "srs.labels" "tempo" | nindent 4 }}
+spec:
+  selector: { app: tempo }
+  ports:
+    - { name: http, port: 3200, targetPort: 3200 }
+    - { name: otlp-grpc, port: 4317, targetPort: 4317 }
+    - { name: otlp-http, port: 4318, targetPort: 4318 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  labels: {{- include "srs.labels" "grafana" | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "grafana" | nindent 8 }}
+    spec:
+      containers:
+        - name: grafana
+          image: {{ .Values.observability.grafana.image }}
+          env:
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Admin" }
+            - { name: GF_SECURITY_ADMIN_PASSWORD, value: "admin" }
+          ports: [{ containerPort: 3000 }]
+          volumeMounts:
+            - { name: datasources, mountPath: /etc/grafana/provisioning/datasources }
+          resources: {{- toYaml .Values.observability.grafana.resources | nindent 12 }}
+      volumes:
+        - { name: datasources, configMap: { name: grafana-datasources } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  labels: {{- include "srs.labels" "grafana" | nindent 4 }}
+spec:
+  selector: { app: grafana }
+  ports: [{ name: http, port: 3000, targetPort: 3000 }]
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.grafanaHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: grafana, port: { number: 3000 } } }
+{{- end }}
+{{- end }}

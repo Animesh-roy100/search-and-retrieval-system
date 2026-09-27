@@ -1,0 +1,182 @@
+{{- $otel := ternary "http://tempo:4317" "" .Values.observability.enabled -}}
+{{- $teiEmbed := ternary "http://tei-embed:80" "" .Values.tei.enabled -}}
+{{- $teiRerank := ternary "http://tei-rerank:80" "" .Values.tei.enabled -}}
+{{- $litellmUrl := ternary "http://litellm:4000" "" .Values.litellm.enabled -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: normalizer
+  labels: {{- include "srs.labels" "normalizer" | nindent 4 }}
+spec:
+  replicas: {{ .Values.normalizer.replicas }}
+  selector: { matchLabels: { app: normalizer } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "normalizer" | nindent 8 }}
+    spec:
+      containers:
+        - name: normalizer
+          image: {{ include "srs.image" (dict "ctx" $ "image" .Values.normalizer.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - { name: REDPANDA_BROKERS, value: "redpanda:29092" }
+            - { name: CDC_TOPIC, value: "cdc.public.documents" }
+            - { name: METRICS_ADDR, value: ":9100" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "{{ $otel }}" }
+            - { name: OTEL_EXPORTER_OTLP_INSECURE, value: "true" }
+          ports: [{ name: metrics, containerPort: 9100 }]
+          readinessProbe: { tcpSocket: { port: 9100 }, initialDelaySeconds: 10, periodSeconds: 10 }
+          resources: {{- toYaml .Values.normalizer.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: normalizer
+  labels: {{- include "srs.labels" "normalizer" | nindent 4 }}
+spec:
+  selector: { app: normalizer }
+  ports: [{ name: metrics, port: 9100, targetPort: 9100 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indexer
+  labels: {{- include "srs.labels" "indexer" | nindent 4 }}
+spec:
+  replicas: {{ .Values.indexer.replicas }}
+  selector: { matchLabels: { app: indexer } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "indexer" | nindent 8 }}
+    spec:
+      containers:
+        - name: indexer
+          image: {{ include "srs.image" (dict "ctx" $ "image" .Values.indexer.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - { name: REDPANDA_BROKERS, value: "redpanda:29092" }
+            - { name: OPENSEARCH_URL, value: "http://opensearch:9200" }
+            - { name: QDRANT_HOST, value: "qdrant" }
+            - { name: QDRANT_PORT, value: "6334" }
+            - { name: ML_SERVICE_ADDR, value: "http://mlservice:8000" }
+            - { name: TEI_EMBED_URL, value: "{{ $teiEmbed }}" }
+            - { name: TEI_RERANK_URL, value: "{{ $teiRerank }}" }
+            - { name: REDIS_ADDR, value: "redis:6379" }
+            - { name: METRICS_ADDR, value: ":9101" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "{{ $otel }}" }
+            - { name: OTEL_EXPORTER_OTLP_INSECURE, value: "true" }
+          ports: [{ name: metrics, containerPort: 9101 }]
+          readinessProbe: { tcpSocket: { port: 9101 }, initialDelaySeconds: 10, periodSeconds: 10 }
+          resources: {{- toYaml .Values.indexer.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: indexer
+  labels: {{- include "srs.labels" "indexer" | nindent 4 }}
+spec:
+  selector: { app: indexer }
+  ports: [{ name: metrics, port: 9101, targetPort: 9101 }]
+{{- if .Values.indexer.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: indexer
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: indexer }
+  minReplicas: {{ .Values.indexer.hpa.minReplicas }}
+  maxReplicas: {{ .Values.indexer.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ .Values.indexer.hpa.targetCPUUtilizationPercentage }} }
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: query
+  labels: {{- include "srs.labels" "query" | nindent 4 }}
+spec:
+  replicas: {{ .Values.query.replicas }}
+  selector: { matchLabels: { app: query } }
+  template:
+    metadata:
+      labels: {{- include "srs.labels" "query" | nindent 8 }}
+    spec:
+      containers:
+        - name: query
+          image: {{ include "srs.image" (dict "ctx" $ "image" .Values.query.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - { name: OPENSEARCH_URL, value: "http://opensearch:9200" }
+            - { name: QDRANT_HOST, value: "qdrant" }
+            - { name: QDRANT_PORT, value: "6334" }
+            - { name: ML_SERVICE_ADDR, value: "http://mlservice:8000" }
+            - { name: TEI_EMBED_URL, value: "{{ $teiEmbed }}" }
+            - { name: TEI_RERANK_URL, value: "{{ $teiRerank }}" }
+            - { name: REDIS_ADDR, value: "redis:6379" }
+            - { name: QUERY_ADDR, value: ":8080" }
+            - { name: METRICS_ADDR, value: ":9102" }
+            - { name: LLM_PROVIDER, value: {{ .Values.query.llmProvider | quote }} }
+            - { name: LLM_MODEL, value: {{ .Values.query.llmModel | quote }} }
+            - { name: LITELLM_URL, value: "{{ $litellmUrl }}" }
+            - { name: LITELLM_API_KEY, value: {{ .Values.litellm.masterKey | quote }} }
+            - { name: FAITHFULNESS_MODE, value: {{ .Values.query.faithfulnessMode | quote }} }
+            - { name: SEM_CACHE, value: {{ .Values.query.semCache | quote }} }
+            - { name: SEM_CACHE_THRESHOLD, value: {{ .Values.query.semCacheThreshold | quote }} }
+            - { name: REQUEST_TIMEOUT, value: {{ .Values.query.requestTimeout | quote }} }
+            - { name: QUERY_API_KEY, value: {{ .Values.query.apiKey | quote }} }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "{{ $otel }}" }
+            - { name: OTEL_EXPORTER_OTLP_INSECURE, value: "true" }
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: metrics, containerPort: 9102 }
+          readinessProbe: { httpGet: { path: /health, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }
+          resources: {{- toYaml .Values.query.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: query
+  labels: {{- include "srs.labels" "query" | nindent 4 }}
+spec:
+  selector: { app: query }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+    - { name: metrics, port: 9102, targetPort: 9102 }
+{{- if .Values.query.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: query
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: query }
+  minReplicas: {{ .Values.query.hpa.minReplicas }}
+  maxReplicas: {{ .Values.query.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ .Values.query.hpa.targetCPUUtilizationPercentage }} }
+{{- end }}
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: query
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.queryHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: query, port: { number: 8080 } } }
+{{- end }}
