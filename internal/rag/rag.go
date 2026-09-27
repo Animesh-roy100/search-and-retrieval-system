@@ -56,6 +56,11 @@ func NewProvider() Provider {
 			return NewGemini(key, os.Getenv("LLM_MODEL"))
 		}
 		fallthrough
+	case "litellm":
+		if url := os.Getenv("LITELLM_URL"); url != "" {
+			return NewLiteLLM(url, os.Getenv("LITELLM_API_KEY"), os.Getenv("LLM_MODEL"))
+		}
+		fallthrough
 	default:
 		return &ExtractiveProvider{}
 	}
