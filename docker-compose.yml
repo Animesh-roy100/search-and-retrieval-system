@@ -103,9 +103,11 @@ services:
   mlservice:
     build:
       context: ./mlservice
+      args:
+        REQS: ${ML_REQS:-requirements-slim.txt}
     environment:
-      EMBED_BACKEND: hash
-      RERANK_BACKEND: lexical
+      EMBED_BACKEND: ${EMBED_BACKEND:-hash}
+      RERANK_BACKEND: ${RERANK_BACKEND:-lexical}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4317}
       OTEL_EXPORTER_OTLP_INSECURE: "true"
     ports: ["8000:8000"]
@@ -175,7 +177,12 @@ services:
       QUERY_ADDR: ":8080"
       METRICS_ADDR: ":9102"
       LLM_PROVIDER: ${LLM_PROVIDER:-extractive}
+      LLM_MODEL: ${LLM_MODEL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      FAITHFULNESS_MODE: ${FAITHFULNESS_MODE:-lexical}
+      SEM_CACHE: ${SEM_CACHE:-true}
+      SEM_CACHE_THRESHOLD: ${SEM_CACHE_THRESHOLD:-0.95}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4317}
       OTEL_EXPORTER_OTLP_INSECURE: "true"
     ports: ["${QUERY_HOST_PORT:-8080}:8080", "9102:9102"]
