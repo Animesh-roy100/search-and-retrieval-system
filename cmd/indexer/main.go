@@ -35,7 +35,7 @@ var tracer = tracing.Tracer("indexer")
 type indexer struct {
 	os    *opensearch.Client
 	qd    *qdrant.Client
-	ml    *mlclient.Client
+	ml    mlclient.ML
 	guard *idempotency.Guard
 	cache *cache.Cache // used only to bump per-tenant cache generation on write
 	dlq   string
@@ -61,7 +61,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("indexer: qdrant client: %v", err)
 	}
-	mlc := mlclient.New(config.Str("ML_SERVICE_ADDR", "http://localhost:8000"))
+	mlc := mlclient.FromEnv(config.Str("ML_SERVICE_ADDR", "http://localhost:8000"))
 	guard := idempotency.NewGuard()
 	invalidator := cache.New(config.Str("REDIS_ADDR", ""), 0) // no-op if REDIS_ADDR unset
 
@@ -312,7 +312,7 @@ func (ix *indexer) toDLQ(ctx context.Context, original []byte, reason string) {
 	}
 }
 
-func probeDim(ctx context.Context, mlc *mlclient.Client) int {
+func probeDim(ctx context.Context, mlc mlclient.ML) int {
 	vecs, _, err := mlc.Embed(ctx, []string{"probe"})
 	if err != nil || len(vecs) == 0 {
 		log.Printf("indexer: dim probe failed (%v); defaulting to 768", err)
