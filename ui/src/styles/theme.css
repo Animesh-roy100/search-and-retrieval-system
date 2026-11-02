@@ -1,0 +1,171 @@
+/* PrismSearch theme — mirrors the sketch design system's token architecture:
+ *   raw tokens (fonts / spacing / radius / color ramps)  →  semantic roles  →
+ *   Tailwind @theme bridge  →  utility classes used by components.
+ * Dark-first, with a green brand ramp matching the sketch primitives.
+ */
+@import 'tailwindcss';
+
+/* ── Raw tokens ──────────────────────────────────────────────────────────── */
+:root {
+  /* Typography (Inter body / Manrope headings / Source Code Pro mono) */
+  --font-family-body: 'Inter', system-ui, sans-serif;
+  --font-family-header: 'Manrope', system-ui, sans-serif;
+  --font-family-mono: 'Source Code Pro', ui-monospace, monospace;
+
+  /* Spacing — 8px base scale */
+  --spacing-2: 2px;
+  --spacing-4: 4px;
+  --spacing-6: 6px;
+  --spacing-8: 8px;
+  --spacing-12: 12px;
+  --spacing-16: 16px;
+  --spacing-20: 20px;
+  --spacing-24: 24px;
+  --spacing-32: 32px;
+  --spacing-40: 40px;
+  --spacing-48: 48px;
+  --spacing-64: 64px;
+
+  /* Radius */
+  --radius-4: 4px;
+  --radius-6: 6px;
+  --radius-8: 8px;
+  --radius-10: 10px;
+  --radius-12: 12px;
+  --radius-16: 16px;
+
+  /* Brand ramp — violet/indigo "prism" palette (distinct from sketch's green) */
+  --color-brand-3: #1e1b3a;
+  --color-brand-5: #3a2f8f;
+  --color-brand-8: #8b7cf6;
+  --color-brand-9: #6d5ef0;
+  --color-brand-10: #a594f9;
+  --color-brand-11: #b4a5ff;
+  --color-brand-12: #ece9ff;
+}
+
+/* ── Semantic roles (dark theme) ─────────────────────────────────────────── */
+:root {
+  --bg-default: #0b0b14;
+  --bg-surface: #11121d;
+  --bg-surface-raised: #181926;
+  --bg-surface-floating: #1f2030;
+  --bg-hover: #1c1d2c;
+  --bg-active: #242536;
+  --bg-selected: #1e1b3a;
+
+  --bg-brand-primary: var(--color-brand-9);
+  --bg-brand-hover: #7e70f4;
+  --bg-brand-subtle: #1a1733;
+  --bg-brand-solid: var(--color-brand-11);
+
+  --bg-success-subtle: #0e2219;
+  --bg-warning-subtle: #2a2008;
+  --bg-danger-subtle: #2a1313;
+  --bg-info-subtle: #0c1f2e;
+
+  --text-primary: #ecedf5;
+  --text-secondary: #a3a6bd;
+  --text-tertiary: #6e7189;
+  --text-brand: var(--color-brand-11);
+  --text-on-brand: #ffffff;
+  --text-success: #3fcf8e;
+  --text-warning: #e5b94e;
+  --text-danger: #f87171;
+  --text-info: #5cc3f2;
+
+  --border-default: #22232f;
+  --border-strong: #30313f;
+  --border-brand: var(--color-brand-9);
+  --border-danger: #4a2020;
+  --border-focus: var(--color-brand-11);
+
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.3), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.4), 0 4px 6px -4px rgb(0 0 0 / 0.4);
+}
+
+/* ── Tailwind bridge: expose roles as utilities (bg-brand, text-tertiary, …) ── */
+@theme inline {
+  --font-sans: var(--font-family-body);
+  --font-heading: var(--font-family-header);
+  --font-mono: var(--font-family-mono);
+
+  --color-background: var(--bg-default);
+  --color-surface: var(--bg-surface);
+  --color-surface-raised: var(--bg-surface-raised);
+  --color-surface-floating: var(--bg-surface-floating);
+  --color-hover: var(--bg-hover);
+  --color-active: var(--bg-active);
+  --color-selected: var(--bg-selected);
+  --color-shell-tint: color-mix(in srgb, var(--bg-brand-primary) 9%, var(--bg-default));
+
+  --color-brand: var(--bg-brand-primary);
+  --color-brand-hover: var(--bg-brand-hover);
+  --color-brand-subtle: var(--bg-brand-subtle);
+  --color-brand-solid: var(--bg-brand-solid);
+
+  --color-success-subtle: var(--bg-success-subtle);
+  --color-warning-subtle: var(--bg-warning-subtle);
+  --color-danger-subtle: var(--bg-danger-subtle);
+  --color-info-subtle: var(--bg-info-subtle);
+
+  --color-foreground: var(--text-primary);
+  --color-foreground-secondary: var(--text-secondary);
+  --color-foreground-tertiary: var(--text-tertiary);
+  --color-foreground-brand: var(--text-brand);
+  --color-foreground-on-brand: var(--text-on-brand);
+  --color-foreground-success: var(--text-success);
+  --color-foreground-warning: var(--text-warning);
+  --color-foreground-danger: var(--text-danger);
+  --color-foreground-info: var(--text-info);
+
+  --color-border: var(--border-default);
+  --color-border-strong: var(--border-strong);
+  --color-border-brand: var(--border-brand);
+  --color-border-danger: var(--border-danger);
+
+  --radius-md: var(--radius-6);
+  --radius-lg: var(--radius-10);
+  --radius-xl: var(--radius-16);
+
+  --shadow-card: var(--shadow-md);
+  --shadow-float: var(--shadow-lg);
+}
+
+/* ── Base ────────────────────────────────────────────────────────────────── */
+@layer base {
+  * {
+    border-color: var(--border-default);
+  }
+  html {
+    font-family: var(--font-family-body);
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    margin: 0;
+    background: var(--bg-default);
+    color: var(--text-primary);
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-family-header);
+  }
+  :where(button, a, [role='button'], summary, label[for]):not(:disabled) {
+    cursor: pointer;
+  }
+  ::selection {
+    background: var(--color-brand-9);
+    color: #fff;
+  }
+}
+
+/* Typography roles (size + line-height pairs from sketch) */
+@layer components {
+  .type-text-xs { font-size: 12px; line-height: 18px; }
+  .type-text-sm { font-size: 14px; line-height: 20px; }
+  .type-text-md { font-size: 16px; line-height: 24px; }
+  .type-text-lg { font-size: 18px; line-height: 28px; }
+  .type-header-sm { font-size: 16px; line-height: 24px; letter-spacing: -0.01em; }
+  .type-header-md { font-size: 20px; line-height: 28px; letter-spacing: -0.02em; }
+  .type-header-lg { font-size: 24px; line-height: 34px; letter-spacing: -0.02em; }
+  .type-header-xl { font-size: 32px; line-height: 44px; letter-spacing: -0.02em; }
+}

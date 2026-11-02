@@ -243,6 +243,22 @@ services:
       timeout: 3s
       retries: 30
 
+  # --- web UI ---
+  # React SPA (Vite build) served by nginx, which reverse-proxies /api/* to the query
+  # service (so the browser only talks to one origin — no CORS). Open http://localhost:5173.
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    depends_on:
+      query: { condition: service_healthy }
+    ports: ["${UI_HOST_PORT:-5173}:80"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
   # --- observability ---
   prometheus:
     image: prom/prometheus:v2.55.1
