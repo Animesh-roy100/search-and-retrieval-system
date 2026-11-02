@@ -142,7 +142,7 @@ client — there are **no hand-written protocol clients**:
 
 - **Normalize at the edge** — every source becomes one canonical doc shape (`internal/contract`); the core (indexer, stores, retrieval, RAG) is source-agnostic.
 - **Priority tiers** — urgent changes hit `docs.fast` (200 ms flush); bulk changes batch on `docs.bulk` (2 s flush / 256-doc cap). Separate consumer groups so a bulk backlog never blocks the fast lane.
-- **Per-source idempotency** — apply only if `version` strictly increases for a `doc_id`; deterministic UUIDv5 point ids + OpenSearch external versioning make upserts safe on replay.
+- **Per-source idempotency** — source versions increase monotonically; lower versions are rejected while equal-version sink retries are accepted so partial dual writes converge. Deterministic UUIDv5 point ids + OpenSearch `external_gte` make replays safe.
 - **Graceful degradation** — Qdrant down → BM25-only; OpenSearch down → vector-only; ML down → skip rerank; LLM down → return docs.
 - **Grounded RAG** — the default provider is extractive-and-cited, so answers are faithful by construction; a faithfulness score (fraction of answer sentences supported by a source) gates the response and is exported as a metric.
 - **Measured** — `doc_freshness_lag_seconds{source,tier}` is the signature SLO metric (Grafana panel with a 5 s threshold); retrieval quality via the offline ablation harness.
@@ -168,6 +168,8 @@ See `docs/HLD.md` / `docs/LLD.md` for architecture and `docs/RUNBOOK.md` for ope
 
 ## Endpoints (when up)
 
+- Web UI: http://localhost:5173 — hybrid **Search**, grounded **Ask (RAG)** with inline
+  citations + faithfulness, and a **Health** panel
 - Query API: `POST http://localhost:8080/search` and `POST http://localhost:8080/ask`
 - Grafana: http://localhost:3000 (anonymous admin) → dashboard *Retrieval + RAG — Freshness & Quality*
 - Prometheus: http://localhost:9090

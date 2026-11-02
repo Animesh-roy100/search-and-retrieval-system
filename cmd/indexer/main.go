@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os/signal"
 	"strconv"
@@ -32,14 +34,31 @@ import (
 
 var tracer = tracing.Tracer("indexer")
 
+type searchIndex interface {
+	Bulk(context.Context, []contract.CanonicalDoc) (map[string]bool, error)
+}
+
+type vectorIndex interface {
+	Upsert(context.Context, []qdrant.Point) error
+	DeleteByDocIDs(context.Context, []string) error
+}
+
+type cacheInvalidator interface {
+	BumpGeneration(context.Context, string)
+}
+
+type syncProducer interface {
+	ProduceSync(context.Context, ...*kgo.Record) kgo.ProduceResults
+}
+
 type indexer struct {
-	os    *opensearch.Client
-	qd    *qdrant.Client
+	os    searchIndex
+	qd    vectorIndex
 	ml    mlclient.ML
 	guard *idempotency.Guard
-	cache *cache.Cache // used only to bump per-tenant cache generation on write
+	cache cacheInvalidator // bumps per-tenant cache generation after a complete write
 	dlq   string
-	prod  *kgo.Client
+	prod  syncProducer
 }
 
 func main() {
@@ -107,6 +126,49 @@ func main() {
 	ix.runLane(ctx, brokers, group+"-bulk", bulkTopic, bulkFlush, "bulk")
 }
 
+type poisonRecord struct {
+	original []byte
+	reason   string
+}
+
+type pendingBatch struct {
+	docs        []contract.CanonicalDoc
+	poisons     []poisonRecord
+	records     []*kgo.Record
+	docsApplied bool
+	nextPoison  int
+}
+
+func (b *pendingBatch) empty() bool { return len(b.records) == 0 }
+
+type commitRecords func(context.Context, ...*kgo.Record) error
+
+// flushPending completes every side effect for the pending records before committing
+// their exact offsets. Progress is retained across transient failures so a commit retry
+// does not repeat successful sink writes or DLQ publications within this process.
+func (ix *indexer) flushPending(ctx context.Context, b *pendingBatch, tier string, commit commitRecords) error {
+	if b.empty() {
+		return nil
+	}
+	if !b.docsApplied {
+		if err := ix.apply(ctx, b.docs, tier); err != nil {
+			return fmt.Errorf("apply: %w", err)
+		}
+		b.docsApplied = true
+	}
+	for b.nextPoison < len(b.poisons) {
+		p := b.poisons[b.nextPoison]
+		if err := ix.toDLQ(ctx, p.original, p.reason); err != nil {
+			return err
+		}
+		b.nextPoison++
+	}
+	if err := commit(ctx, b.records...); err != nil {
+		return fmt.Errorf("commit records: %w", err)
+	}
+	return nil
+}
+
 func (ix *indexer) runLane(ctx context.Context, brokers []string, group, topic string, flush time.Duration, tier string) {
 	cl, err := ikafka.NewConsumer(brokers, group, topic)
 	if err != nil {
@@ -115,68 +177,84 @@ func (ix *indexer) runLane(ctx context.Context, brokers []string, group, topic s
 	defer cl.Close()
 	log.Printf("indexer[%s]: consuming %s (flush %s)", tier, topic, flush)
 
-	var batch []contract.CanonicalDoc
-	var raws [][]byte
-	var batchStart time.Time // when the current batch's first record was buffered
-
-	flushBatch := func() {
-		if len(batch) == 0 {
-			return
+	var pending pendingBatch
+	var batchStart time.Time
+	flushBatch := func(flushCtx context.Context) bool {
+		if pending.empty() {
+			return true
 		}
-		if err := ix.apply(ctx, batch, tier); err != nil {
-			log.Printf("indexer[%s]: apply failed (will retry): %v", tier, err)
-			return // do not commit; messages re-delivered
+		if err := ix.flushPending(flushCtx, &pending, tier, cl.CommitRecords); err != nil {
+			log.Printf("indexer[%s]: flush failed (will retry without polling): %v", tier, err)
+			return false
 		}
-		if err := cl.CommitUncommittedOffsets(ctx); err != nil {
-			log.Printf("indexer[%s]: commit: %v", tier, err)
-		}
-		batch = batch[:0]
-		raws = raws[:0]
+		pending = pendingBatch{}
 		batchStart = time.Time{}
+		return true
 	}
 
+	retryPending := false
 	for {
-		// Bound each poll to the flush interval so the time-based flush below is
-		// re-evaluated even when the lane is idle. Without this, PollFetches blocks
-		// until new records arrive and a buffered batch is stranded — which strands
-		// the low-traffic bulk lane indefinitely.
+		// Do not fetch beyond a failed batch. Retrying the same in-memory state keeps
+		// partition offsets contiguous and avoids unbounded buffering during outages.
+		if retryPending {
+			select {
+			case <-ctx.Done():
+				flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = flushBatch(flushCtx)
+				cancel()
+				return
+			case <-time.After(time.Second):
+			}
+			retryPending = !flushBatch(ctx)
+			continue
+		}
+
+		// Bound each poll to the flush interval so a low-traffic batch, including a
+		// poison-only tail batch, is never stranded while waiting for another record.
 		pollCtx, cancel := context.WithTimeout(ctx, flush)
 		fetches := cl.PollFetches(pollCtx)
 		cancel()
 		if ctx.Err() != nil {
-			flushBatch()
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = flushBatch(flushCtx)
+			flushCancel()
 			return
 		}
 		if errs := fetches.Errors(); len(errs) > 0 {
 			for _, e := range errs {
 				if errors.Is(e.Err, context.DeadlineExceeded) {
-					continue // idle poll timeout — expected; lets the flush timer run
+					continue
 				}
 				log.Printf("indexer[%s]: fetch: %v", tier, e.Err)
 			}
 		}
 		fetches.EachRecord(func(r *kgo.Record) {
+			if pending.empty() {
+				batchStart = time.Now()
+			}
+			// Keep a stable copy until CommitRecords completes; franz-go may reuse poll
+			// result storage after the next poll.
+			record := *r
+			pending.records = append(pending.records, &record)
+
 			var d contract.CanonicalDoc
 			if err := json.Unmarshal(r.Value, &d); err != nil {
-				ix.toDLQ(ctx, r.Value, "decode_error")
+				pending.poisons = append(pending.poisons, poisonRecord{
+					original: append([]byte(nil), r.Value...), reason: "decode_error",
+				})
 				return
 			}
 			if err := d.Validate(); err != nil {
-				ix.toDLQ(ctx, r.Value, "invalid_doc")
+				pending.poisons = append(pending.poisons, poisonRecord{
+					original: append([]byte(nil), r.Value...), reason: "invalid_doc",
+				})
 				return
 			}
-			if len(batch) == 0 {
-				batchStart = time.Now()
-			}
-			batch = append(batch, d)
-			raws = append(raws, r.Value)
+			pending.docs = append(pending.docs, d)
 		})
 
-		// Flush when the batch is full (throughput) OR when the flush interval has
-		// elapsed since the first buffered record (bounded latency). The bounded poll
-		// above guarantees this check runs at least once per flush interval.
-		if len(batch) >= 256 || (len(batch) > 0 && time.Since(batchStart) >= flush) {
-			flushBatch()
+		if len(pending.records) >= 256 || (!pending.empty() && time.Since(batchStart) >= flush) {
+			retryPending = !flushBatch(ctx)
 		}
 	}
 }
@@ -207,10 +285,10 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 		return nil
 	}
 
-	// 2) OpenSearch first — it is the version authority. External versioning means
-	// stale writes are rejected (409) here; the returned set is the docs actually
-	// applied, and only those are propagated to Qdrant. This keeps the two stores
-	// consistent even when the in-memory guard is empty (restart / group rebalance).
+	// 2) OpenSearch first — it is the version authority. external_gte rejects lower
+	// versions but accepts an equal-version replay, allowing a prior OpenSearch-success /
+	// Qdrant-failure attempt to reach Qdrant again. Only the safe returned set is
+	// propagated, so a strictly stale event can never overwrite the vector store.
 	osCtx, osSp := tracer.Start(ctx, "opensearch.bulk")
 	t0 := time.Now()
 	applied, err := ix.os.Bulk(osCtx, toApply)
@@ -251,8 +329,15 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 				Vector: vecs[i],
 				Payload: map[string]any{
 					"doc_id": d.DocID, "source": d.Source,
-					"tenant_id": d.TenantID, "category": d.Metadata.Category,
-					"version": d.Version, "model_version": modelVer,
+					// Keep tenant_id a string to match query filters and OpenSearch's
+					// keyword mapping. Title/body make vector-only degradation usable
+					// when OpenSearch is unavailable.
+					"tenant_id":     strconv.FormatInt(d.TenantID, 10),
+					"title":         d.Title,
+					"body":          d.Body,
+					"category":      d.Metadata.Category,
+					"version":       d.Version,
+					"model_version": modelVer,
 				},
 			})
 		}
@@ -302,13 +387,24 @@ func (ix *indexer) apply(ctx context.Context, docs []contract.CanonicalDoc, tier
 	return nil
 }
 
-func (ix *indexer) toDLQ(ctx context.Context, original []byte, reason string) {
-	obs.DLQEvents.WithLabelValues("postgres", reason).Inc()
-	env := map[string]any{"error": reason, "stage": "indexer", "original": json.RawMessage(original)}
-	b, _ := json.Marshal(env)
-	if err := ix.prod.ProduceSync(ctx, &kgo.Record{Topic: ix.dlq, Value: b}).FirstErr(); err != nil {
-		log.Printf("indexer: dlq produce: %v", err)
+func (ix *indexer) toDLQ(ctx context.Context, original []byte, reason string) error {
+	env := map[string]any{"error": reason, "stage": "indexer"}
+	if json.Valid(original) {
+		env["original"] = json.RawMessage(original)
+	} else {
+		// Arbitrary poison bytes cannot safely be embedded as RawMessage. Preserve
+		// them losslessly for inspection/replay instead of emitting an empty record.
+		env["original_b64"] = base64.StdEncoding.EncodeToString(original)
 	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshal dlq envelope: %w", err)
+	}
+	if err := ix.prod.ProduceSync(ctx, &kgo.Record{Topic: ix.dlq, Value: b}).FirstErr(); err != nil {
+		return fmt.Errorf("publish dlq: %w", err)
+	}
+	obs.DLQEvents.WithLabelValues("postgres", reason).Inc()
+	return nil
 }
 
 func probeDim(ctx context.Context, mlc mlclient.ML) int {

@@ -98,8 +98,13 @@ func (c *Client) DeleteByDocIDs(ctx context.Context, docIDs []string) error {
 }
 
 type Hit struct {
-	DocID string
-	Score float64
+	DocID    string
+	Source   string
+	Title    string
+	Body     string
+	Category string
+	Version  int64
+	Score    float64
 }
 
 // Search runs ANN search with optional payload filters (exact match).
@@ -123,13 +128,36 @@ func (c *Client) Search(ctx context.Context, vector []float32, filters map[strin
 	}
 	hits := make([]Hit, 0, len(res))
 	for _, p := range res {
-		docID := ""
-		if v, ok := p.GetPayload()["doc_id"]; ok {
-			docID = v.GetStringValue()
+		payload := p.GetPayload()
+		docID := payloadString(payload, "doc_id")
+		if docID == "" {
+			continue // malformed point cannot participate in document retrieval
 		}
-		hits = append(hits, Hit{DocID: docID, Score: float64(p.GetScore())})
+		hits = append(hits, Hit{
+			DocID:    docID,
+			Source:   payloadString(payload, "source"),
+			Title:    payloadString(payload, "title"),
+			Body:     payloadString(payload, "body"),
+			Category: payloadString(payload, "category"),
+			Version:  payloadInt(payload, "version"),
+			Score:    float64(p.GetScore()),
+		})
 	}
 	return hits, nil
+}
+
+func payloadString(payload map[string]*qc.Value, key string) string {
+	if v, ok := payload[key]; ok {
+		return v.GetStringValue()
+	}
+	return ""
+}
+
+func payloadInt(payload map[string]*qc.Value, key string) int64 {
+	if v, ok := payload[key]; ok {
+		return v.GetIntegerValue()
+	}
+	return 0
 }
 
 // Health verifies connectivity by listing collections.

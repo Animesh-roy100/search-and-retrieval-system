@@ -47,7 +47,7 @@ end-to-end OpenTelemetry tracing with a Tempo service graph. See §12 for the ch
 | Fusion | RRF (k=60) | No score normalization, robust, cheap. |
 | Rerank / embeddings | **Python ML service** | Model ecosystem lives in Python; called over gRPC/HTTP. |
 | Generation | Claude (`claude-opus-4-8` quality / `claude-haiku-4-5` cheap) | Grounded answers + faithfulness judging. |
-| Idempotency authority | **OpenSearch external versioning** drives Qdrant | Stale replays rejected at one authority; both stores stay consistent even with an empty in-memory guard (restart/rebalance). |
+| Idempotency authority | **OpenSearch `external_gte` versioning** drives Qdrant | Lower versions are rejected; equal-version retries let partial dual writes converge after restart/rebalance. |
 | Answer cache | **Redis exact-match + Qdrant semantic**, generation-invalidated | Fast exact hits + paraphrase hits; a write bumps the tenant generation so stale answers are instantly unreachable. |
 | Isolation / auth | **Server-side `tenant_id` + optional API key** | Client can't read cross-tenant; tenant is part of the cache key. |
 | Observability | Prometheus + Grafana; **OTel → Tempo (traces + service graph)** | End-to-end distributed traces across Go+Python; live service topology. |
@@ -389,7 +389,7 @@ DoorDash rebuilt search on Apache Lucene with three services and reported **50% 
 **v1 cut = Phases 0–5.5** (≈3 weekends). Ship before starting v2.
 
 ### Change log
-- **Rev 3 (implemented v1):** durable idempotency — OpenSearch is the version authority (external versioning on deletes too) and drives Qdrant off the applied-doc set, so stale replays/rebalances can't corrupt or delete data (proven by an integration test); server-side tenant isolation + optional API key; generation-based cache invalidation; a Qdrant-backed **semantic** answer cache alongside the Redis exact-match cache; optional **LLM faithfulness judge** (`FAITHFULNESS_MODE`, lexical default/fallback); truly concurrent BM25+vector retrieval with a request deadline; bulk-lane idle-flush fix; **OpenTelemetry** tracing across Go+Python with a **Tempo service graph**; `google/uuid` for point ids.
+- **Rev 3 (implemented v1):** durable idempotency — OpenSearch is the `external_gte` version authority (on deletes too) and drives Qdrant off the applied-doc set, so stale replays/rebalances can't corrupt or delete data (proven by an integration test); server-side tenant isolation + optional API key; generation-based cache invalidation; a Qdrant-backed **semantic** answer cache alongside the Redis exact-match cache; optional **LLM faithfulness judge** (`FAITHFULNESS_MODE`, lexical default/fallback); truly concurrent BM25+vector retrieval with a request deadline; bulk-lane idle-flush fix; **OpenTelemetry** tracing across Go+Python with a **Tempo service graph**; `google/uuid` for point ids.
 - **Rev 2:** multi-source ingestion (normalizer + canonical doc), priority-tiered freshness (fast/bulk lanes), `source` field + provenance in citations, per-source+tier freshness metric, formalized Query Understanding & Planning stage, DoorDash prior-art + future-work sections.
 - **Rev 1:** initial single-source (Postgres) retrieval + RAG design.
 

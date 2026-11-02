@@ -36,9 +36,18 @@ import (
 // tracer resolves the global provider lazily, so package-level init is safe.
 var tracer = tracing.Tracer("query")
 
+type lexicalStore interface {
+	Search(context.Context, string, map[string]string, int) ([]opensearch.Hit, error)
+	GetByIDs(context.Context, []string) (map[string]opensearch.Doc, error)
+}
+
+type vectorStore interface {
+	Search(context.Context, []float32, map[string]string, int) ([]qdrant.Hit, error)
+}
+
 type server struct {
-	os        *opensearch.Client
-	qd        *qdrant.Client
+	os        lexicalStore
+	qd        vectorStore
 	ml        mlclient.ML
 	cache     *cache.Cache
 	sem       *semcache.Cache
@@ -196,6 +205,7 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 	// degrades independently (BM25-only if the embed/Qdrant is down, vector-only if
 	// OpenSearch is down). Both are bounded by the request's context deadline.
 	var bm25IDs, vecIDs []string
+	vectorDocs := make(map[string]qdrant.Hit)
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -236,6 +246,7 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 		if hits, err := s.qd.Search(vecCtx, v, filters, s.rerankN); err == nil {
 			for _, h := range hits {
 				vecIDs = append(vecIDs, h.DocID)
+				vectorDocs[h.DocID] = h
 			}
 		} else {
 			log.Printf("query: qdrant down, BM25-only: %v", err)
@@ -259,12 +270,27 @@ func (s *server) retrieve(ctx context.Context, query string, filters map[string]
 		}
 	}
 
-	// 4) fetch doc content for rerank + context.
+	// 4) Fetch content for rerank + context. OpenSearch is preferred because it is the
+	// lexical/version authority, but every Qdrant hit also carries enough canonical
+	// content to keep vector-only retrieval usable during an OpenSearch outage.
 	docs, err := s.os.GetByIDs(ctx, ids)
 	if err != nil {
-		return nil, err
+		log.Printf("query: opensearch content unavailable, assembling from qdrant: %v", err)
+		docs = make(map[string]opensearch.Doc)
 	}
-	// keep only ids we actually have content for, in fused order
+	for _, id := range ids {
+		if _, ok := docs[id]; ok {
+			continue
+		}
+		if h, ok := vectorDocs[id]; ok && (h.Title != "" || h.Body != "") {
+			docs[id] = opensearch.Doc{
+				DocID: h.DocID, Source: h.Source, Title: h.Title,
+				Body: h.Body, Category: h.Category,
+			}
+		}
+	}
+
+	// Keep only ids we actually have content for, in fused order.
 	var haveIDs []string
 	var texts []string
 	for _, id := range ids {

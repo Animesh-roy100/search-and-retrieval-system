@@ -117,7 +117,7 @@ CREATE PUBLICATION retrieval_pub FOR TABLE documents;
 ```
 collection: documents
 vector: { size: 768, distance: Cosine }
-payload: { doc_id, source, tenant_id, category, version, model_version, commit_ts }
+payload: { doc_id, source, tenant_id, title, body, category, version, model_version }
 ```
 
 ### 2.6 Entity relationships
@@ -197,7 +197,7 @@ flowchart TD
     J -->|no| M
     J -->|yes| K["bulk upsert OS + Qdrant"]
     K --> L{"partial failure?"}
-    L -->|yes| R["retry failed → DLQ after N"]
+    L -->|yes| R["retry failed → pause lane and retry same batch"]
     L -->|no| N["commit offsets<br/>observe freshness lag{source,tier}"]
     N --> M
 ```
@@ -209,10 +209,10 @@ flowchart TD
 Two layers, so correctness does **not** depend on the volatile in-memory guard:
 
 1. **In-memory guard (optimization):** skip obviously stale in-flight docs (`in.Version > stored`), avoiding wasted embeds. Lost on restart/rebalance — so it cannot be the authority.
-2. **OpenSearch (durable authority):** every write uses `version_type=external`, **including deletes**. A stale upsert or a stale delete (e.g. a DLQ replay) is rejected with `409`. `Bulk` returns the **set of doc_ids actually applied**; Qdrant is written **only for that set**. Result: the two stores stay consistent even when the guard map is empty.
+2. **OpenSearch (durable authority):** every write uses `version_type=external_gte`, **including deletes**. A lower-version upsert/delete is rejected with `409`, while an equal-version retry is accepted so an OpenSearch-success/Qdrant-failure replay can reach Qdrant again. `Bulk` returns the **set of doc_ids safe to propagate**; Qdrant is written only for that set. The canonical contract requires a source+doc_id+version tuple to be immutable.
 
 ```go
-// OpenSearch _bulk: _id = doc_id, version = in.Version, version_type = external
+// OpenSearch _bulk: _id = doc_id, version = in.Version, version_type = external_gte
 //   upsert: 2xx = applied · 409 = stale (skip) · other >=400 = hard error (retry)
 //   delete: 2xx = applied · 404 = already-absent (applied, safe) · 409 = stale (skip)
 // Bulk returns applied[doc_id]; the indexer embeds + upserts/deletes Qdrant ONLY for applied docs.
@@ -227,9 +227,9 @@ Proven by an integration test (`internal/opensearch`, build tag `integration`): 
 |---|---|
 | Per-doc ordering | Redpanda key = `doc_id` → same partition |
 | At-least-once | commit offsets only after successful bulk write |
-| Idempotent apply | OpenSearch external-version authority (§4.2) + deterministic IDs; Qdrant driven off the applied set |
+| Idempotent apply | OpenSearch `external_gte` authority (§4.2) + deterministic IDs; lower versions are rejected and equal-version retries propagate so Qdrant converges |
 | Stale delete safety | deletes are external-versioned too → a replayed old delete can't remove a re-created doc |
-| Poison events | DLQ topic after N retries; benign `404`-on-delete tolerated (does not poison the batch) |
+| Poison events | Decode/validation failures are published to the DLQ; their exact Kafka offsets are committed only after DLQ publication succeeds |
 | Idle-lane flush | each poll is bounded to the flush interval → a low-traffic lane's buffered batch is never stranded |
 | Backpressure | bounded channel; pause fetch when sinks slow |
 | Tier isolation | separate topics; fast lane not blocked by bulk backlog |

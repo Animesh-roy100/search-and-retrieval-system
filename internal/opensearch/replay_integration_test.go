@@ -1,10 +1,10 @@
 //go:build integration
 
 // Replay-safety integration test. Proves the durable-idempotency guarantee at the
-// version authority (OpenSearch): a stale upsert or a stale delete — exactly what a
-// DLQ replay or a consumer-group rebalance can re-deliver — is rejected and never
-// clobbers or deletes fresher data. Because Qdrant is driven off the applied set
-// this Bulk returns, the same guarantee protects the vector store.
+// version authority (OpenSearch): lower versions are rejected, while equal versions
+// are accepted so a partial dual-write retry can reach Qdrant and converge. A stale
+// upsert/delete from a DLQ replay or consumer-group rebalance never clobbers fresher
+// data.
 //
 // Run against the live stack:
 //
@@ -54,7 +54,18 @@ func TestReplaySafety_StaleWritesRejected(t *testing.T) {
 	}
 	assertBody(t, c, ctx, id, "v3 body")
 
-	// 2) Stale upsert at v2 (replayed) must NOT apply and must NOT overwrite v3.
+	// 2) Equal-version replay must be accepted so a prior Qdrant failure can recover.
+	// The source+doc+version tuple is immutable, so replay content is identical.
+	applied, err = c.Bulk(ctx, []contract.CanonicalDoc{doc(id, 3, contract.OpUpsert, "v3 body")})
+	if err != nil {
+		t.Fatalf("equal v3 replay: %v", err)
+	}
+	if !applied[id] {
+		t.Fatal("equal v3 replay must be propagated for Qdrant convergence")
+	}
+	assertBody(t, c, ctx, id, "v3 body")
+
+	// 3) Stale upsert at v2 (replayed) must NOT apply and must NOT overwrite v3.
 	applied, err = c.Bulk(ctx, []contract.CanonicalDoc{doc(id, 2, contract.OpUpsert, "v2 body")})
 	if err != nil {
 		t.Fatalf("stale v2 upsert errored (should be tolerated): %v", err)
@@ -64,7 +75,7 @@ func TestReplaySafety_StaleWritesRejected(t *testing.T) {
 	}
 	assertBody(t, c, ctx, id, "v3 body") // unchanged
 
-	// 3) Stale delete at v1 (replayed) must NOT apply and must NOT remove the doc.
+	// 4) Stale delete at v1 (replayed) must NOT apply and must NOT remove the doc.
 	applied, err = c.Bulk(ctx, []contract.CanonicalDoc{doc(id, 1, contract.OpDelete, "")})
 	if err != nil {
 		t.Fatalf("stale v1 delete errored (should be tolerated): %v", err)
@@ -74,7 +85,7 @@ func TestReplaySafety_StaleWritesRejected(t *testing.T) {
 	}
 	assertBody(t, c, ctx, id, "v3 body") // still present
 
-	// 4) Newer delete at v4 must apply and remove the doc.
+	// 5) Newer delete at v4 must apply and remove the doc.
 	applied, err = c.Bulk(ctx, []contract.CanonicalDoc{doc(id, 4, contract.OpDelete, "")})
 	if err != nil {
 		t.Fatalf("v4 delete: %v", err)

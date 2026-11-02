@@ -79,16 +79,21 @@ type osDoc struct {
 }
 
 // Bulk applies upserts and deletes in a single _bulk request. Both actions use
-// external versioning so a stale write (version <= stored) is rejected with 409
-// rather than clobbering fresher data — this is what makes replay/rebalance safe.
+// external_gte versioning: lower versions are rejected with 409, while an equal-version
+// replay is accepted. Equal-version acceptance is required for dual-write recovery: if
+// OpenSearch succeeded but Qdrant failed, Kafka redelivery must pass the OpenSearch gate
+// again so the idempotent Qdrant operation can converge.
 //
-// It returns the set of doc_ids that were actually applied here: upserts that
-// succeeded (2xx), and deletes that succeeded or found nothing to delete (2xx/404).
-// A 409 means the store already holds an equal-or-newer version, so the doc is
-// NOT in the applied set and callers must not propagate it to other sinks. Any
-// other >=400 status is a hard error (the batch is retried, offsets uncommitted).
+// The canonical event contract treats a source+doc_id+version tuple as immutable; an
+// equal version therefore has identical content. Producers must allocate a new version
+// for every content change.
 //
-// OpenSearch is thus the single version authority; Qdrant is driven off this set.
+// It returns the set of doc_ids safe to propagate to Qdrant: upserts that succeeded
+// (2xx), and deletes that succeeded or found nothing to delete (2xx/404). A 409 means
+// OpenSearch already holds a strictly newer version, so the doc is omitted. Any other
+// >=400 status is a hard error and leaves Kafka offsets uncommitted.
+//
+// OpenSearch is thus the version authority; Qdrant is driven off this set.
 func (c *Client) Bulk(ctx context.Context, docs []contract.CanonicalDoc) (map[string]bool, error) {
 	if len(docs) == 0 {
 		return map[string]bool{}, nil
@@ -103,19 +108,19 @@ func (c *Client) Bulk(ctx context.Context, docs []contract.CanonicalDoc) (map[st
 	enc := json.NewEncoder(&buf)
 	for _, d := range docs {
 		if d.Op == contract.OpDelete {
-			// External version on delete too: a stale delete (e.g. replayed from the
-			// DLQ) must not remove a doc that has since been re-created at a higher
-			// version. OpenSearch rejects it with 409.
+			// external_gte on delete too: a lower-version delete (e.g. replayed from
+			// the DLQ) must not remove a doc recreated at a higher version, while an
+			// equal-version retry must still propagate to Qdrant.
 			_ = enc.Encode(map[string]any{"delete": map[string]any{
 				"_index": Index, "_id": d.DocID,
-				"version": d.Version, "version_type": "external",
+				"version": d.Version, "version_type": "external_gte",
 			}})
 			order = append(order, line{docID: d.DocID, isDelete: true})
 			continue
 		}
 		_ = enc.Encode(map[string]any{"index": map[string]any{
 			"_index": Index, "_id": d.DocID,
-			"version": d.Version, "version_type": "external",
+			"version": d.Version, "version_type": "external_gte",
 		}})
 		_ = enc.Encode(osDoc{
 			DocID: d.DocID, Source: d.Source, TenantID: fmt.Sprintf("%d", d.TenantID),
