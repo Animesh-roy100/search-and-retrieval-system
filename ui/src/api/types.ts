@@ -5,6 +5,7 @@ export interface Source {
   doc_id: string;
   origin: string; // source system, e.g. "postgres"
   text: string;
+  score?: number;
 }
 
 export interface SearchResponse {

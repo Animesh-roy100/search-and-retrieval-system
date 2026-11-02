@@ -13,11 +13,11 @@ import (
 
 // Source is one retrieved chunk offered to the generator, numbered doc_N.
 type Source struct {
-	Marker string // "doc_1"
-	DocID  string
-	Origin string // provenance ("postgres")
-	Text   string
-	Score  float64
+	Marker string  `json:"marker"` // "doc_1"
+	DocID  string  `json:"doc_id"`
+	Origin string  `json:"origin"` // provenance ("postgres")
+	Text   string  `json:"text"`
+	Score  float64 `json:"score"`
 }
 
 // Answer is the generated result.
