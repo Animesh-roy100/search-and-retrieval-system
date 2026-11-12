@@ -1,7 +1,7 @@
 # Slim ML service image: deterministic hash/lexical backends, no torch.
 # For real models, build with --build-arg REQS=requirements.txt and set
 # EMBED_BACKEND=auto / RERANK_BACKEND=auto.
-FROM python:3.12-slim AS base
+FROM python:3.15-slim AS base
 
 ARG REQS=requirements-slim.txt
 WORKDIR /app
